@@ -1,0 +1,2208 @@
+---
+title: "Spatial Transcriptomic Analysis of Brain Organoids "
+author: "George T. Hall"
+date: "Compiled on `r format(Sys.time(), '%d %B %Y')`"
+output:
+    html_document:
+        toc: true
+        toc_depth: 1
+        toc_float:
+            collapsed: false
+        number_sections: true
+        code_folding: none
+        keep_md: true
+---
+
+```{r set_seed}
+set.seed(123)
+```
+
+# Preliminary function definitions
+
+In this section, we define some functions that we will use throughout the rest
+of this notebook. Each definition is hidden by default.
+
+<details>
+<summary>`get_size_factor`</summary>
+```{r get_size_factor_fcn}
+get_size_factor <- function(cells) {
+    coords <- cells@images$slice1@coordinates
+    width <- max(coords$col) - min(coords$col)
+    height <- max(coords$row) - min(coords$row)
+    area <- width * height
+    size_factor <- 140 / sqrt(area)
+
+    return(size_factor)
+}
+```
+</details>
+
+<details>
+<summary>`rotate_image`</summary>
+
+A function to rotate the ST image by any angle.
+
+```{r rotate_image_fcn}
+rotate_image <- function(p, rot_angle) {
+    if (is.null(rot_angle)) {
+        rot_angle <- 0
+    }
+    gt <- ggplot_gtable(ggplot_build(p))
+    panel_idx <- which(gt$layout$name == "panel")
+    rot_vp <- viewport(angle = 360 - rot_angle)
+    gt[["grobs"]][[panel_idx]] <- editGrob(gt[["grobs"]][[panel_idx]],
+                                           vp = rot_vp)
+    p_rot <- ggdraw() + draw_grob(gt)
+
+    return(p_rot)
+}
+```
+</details>
+
+<details>
+<summary>`get_sample_name_from_plot`</summary>
+```{r get_sample_name_from_plot}
+# Work out the sample name based on the number of spots in the plot.
+get_sample_name_from_plot <- function(p) {
+    # prepend "x" so that don't start with number
+    sample_name <- switch(paste0("x", nrow(p$data)),
+           x915 = "PCW_7_REP_3",
+           x2523 = "PCW_11_REP_2",
+           # (only 1855 spots if used for maturation path:)
+           x1855 = "PCW_11_REP_2",
+           # (only 2696 spots if used for maturation path:)
+           x2696 = "PCW_17_REP_3",
+           x3753 = "PCW_17_REP_3",
+           x55 = "Donor1_day40_dif2_org2",
+           x145 = "Donor2_day70_dif2_org2",
+           x249 = "Donor1_day120_dif1_org1")
+
+    return(sample_name)
+}
+```
+</details>
+
+<details>
+<summary>`FixSpatialPlot`</summary>
+
+```{r FixSpatialPlot_fcn}
+FixSpatialPlot <- function(p, sample_name = NULL, num_cells = NULL) {
+    # Run after all other modifications to Spatial*Plot (e.g. changes to theme,
+    # scale colors, etc). Rotate the image and scale the dots appropriately. I
+    # can't see a neater way of doing this for now (rebuilding the ggplot image
+    # in `rotate_image` means that themes etc can no longer be applied:
+    # stackoverflow.com/q/78027896/6914552).
+
+    if (is.null(sample_name)) {
+        sample_name <- get_sample_name_from_plot(p)
+    }
+
+    point_size_factors <- list("PCW_7_REP_3" = 2.4,
+                               "PCW_11_REP_2" = 1.5,
+                               "PCW_11_REP_2_sub" = 15,
+                               "PCW_17_REP_3" = 1.8,
+                               "Donor1_day40_dif2_org2" = 9,
+                               "Donor2_day70_dif2_org2" = 7.5,
+                               "Donor1_day120_dif1_org1" = 5.8,
+                               "Donor1_day40_dif2_org2_sub" = 30,
+                               "Donor2_day70_dif2_org2_sub" = 30,
+                               "Donor1_day120_dif1_org1_sub" = 30)
+
+    if ((!is.null(sample_name)) && (sample_name %in% names(point_size_factors))) {
+        size_factor <- point_size_factors[[sample_name]]
+    } else {
+        size_factor <- 80 / sqrt(num_cells)
+    }
+
+    p$layers[[1]]$aes_params$point.size.factor <- size_factor
+    p <- rotate_image(p, cells[[gsub("_sub", "", sample_name)]]@misc$rot_angle)
+
+    return(p)
+}
+```
+</details>
+
+<details>
+<summary>`SpatialFeaturePlotBlend`</summary>
+```{r SpatialFeaturePlotBlend_fcn}
+gen_color_grid <- function(side_length, bottom_left, bottom_right, top_left,
+                           top_right) {
+
+    grad_gen <- function(start, end, n = side_length) {
+        colfunc <- colorRampPalette(c(start, end))
+        return(colfunc(n))
+    }
+
+    # x_y = "x to y"; "bl" = "bottom left", etc
+    bl_tl <- grad_gen(bottom_left, top_left)
+    br_tr <- grad_gen(bottom_right, top_right)
+
+    l <- lapply(seq_len(length(bl_tl)),
+           function(i) {
+               start <- bl_tl[i]
+               end <- br_tr[i]
+               grad_gen(start, end)
+           })
+
+    return(matrix(unlist(l), ncol = side_length, nrow = side_length))
+}
+
+SpatialFeaturePlotBlend <- function(cells_obj, column_1, column_2,
+                                    combine = TRUE, column_1_alt_name = NULL,
+                                    column_2_alt_name = NULL,
+                                    bottom_left = "#000000",
+                                    bottom_right = "#0000FF",
+                                    top_left = "#FF0000",
+                                    top_right = "#FFFF00", ...)  {
+    # Convert decimal number to hexadecimal. Pad with 0s if only a single
+    # character following conversion.
+    as_hex <- function(num) {
+        hex_str <- as.character(as.hexmode(num))
+        if (nchar(hex_str) == 1) {
+            hex_str <- paste0("0", hex_str)
+        }
+
+        return(hex_str)
+    }
+
+    blend_plot_theme <- theme(legend.position = "none",
+                              plot.title = element_text(hjust = 0.5))
+
+    plot_list <- lapply(c(column_1, column_2),
+                        function(column) {
+                            max_color <- ifelse(column == column_1,
+                                                "#FF0000", "#0000FF")
+                            SpatialFeaturePlot(cells_obj, column, ...) +
+                                scale_fill_gradient(low = "#000000",
+                                                    high = max_color) +
+                                ggtitle(column) +
+                                blend_plot_theme
+                        })
+
+    dat <- FetchData(cells_obj, c(column_1, column_2)) %>%
+            as.matrix()
+    colnames(dat) <- c(column_1, column_2)
+    side_length <- 100
+    col_grid <- gen_color_grid(side_length, bottom_left, bottom_right,
+                               top_left, top_right)
+    dat_norm <- apply(dat, 2,
+                      function(x) {
+                          if (max(x) != 0) {
+                              round((side_length - 1) * x / max(x)) + 1
+                          } else {
+                              rep(1, length(x))
+                          }
+                      })
+    cols <- sapply(seq_len(nrow(dat_norm)),
+                   function(x) {
+                       col_grid[dat_norm[x, 1], dat_norm[x, 2]]
+                   })
+
+    new_md_column <- paste0(column_1, "_vs_", column_2)
+    cells_obj[[new_md_column]] <- cols
+    names(cols) <- as.character(cols)
+
+    plot_list[[3]] <- SpatialDimPlot(cells_obj, new_md_column, cols = cols,
+                                     ...) +
+                        ggtitle(paste0(column_1, "_", column_2)) +
+                        blend_plot_theme
+
+    legend_grid <- expand.grid(seq(from = min(dat[, column_1]),
+                                   to = max(dat[, column_1]),
+                                   length.out = side_length),
+                               seq(from = min(dat[, column_2]),
+                                   to = max(dat[, column_2]),
+                                   length.out = side_length))
+    colnames(legend_grid) <- c(column_1, column_2)
+    legend_colors <- c(col_grid)
+
+    legend_grid$color <- legend_colors
+    names(legend_colors) <- legend_colors
+
+    legend <- ggplot(legend_grid,
+                     aes(x = .data[[column_1]], y = .data[[column_2]],
+                         color = color)) +
+                geom_point(shape = 15, size = 1.9) +
+                scale_color_manual(values = legend_colors) +
+                coord_cartesian(expand = FALSE) +
+                theme(legend.position = "none", aspect.ratio = 1,
+                      panel.background = element_blank(),
+                      axis.text.x = element_text(angle = 45, hjust = 1)) +
+                xlab(ifelse(is.null(column_1_alt_name), column_1, column_1_alt_name)) +
+                ylab(ifelse(is.null(column_2_alt_name), column_2, column_2_alt_name))
+
+    plot_list[[4]] <- wrap_plots(ggplot() + theme_void(), legend,
+                                 ggplot() + theme_void(), ncol = 1,
+                                 heights = c(0.2, 0.6, 0.2))
+
+    if (combine == FALSE) {
+        return(plot_list)
+    } else {
+        p <- wrap_plots(plot_list, nrow = 1,
+                        widths = c(0.28, 0.28, 0.28, 0.16))
+        return(p)
+    }
+}
+```
+</details>
+
+<details>
+<summary>`add_visual_reduction`</summary>
+```{r add_visual_reduction_fcn}
+add_visual_reduction <- function(cell_obj) {
+    old_default_assay <- DefaultAssay(cell_obj)
+    DefaultAssay(cell_obj) <- "Spatial"
+    visual_coords <- GetTissueCoordinates(cell_obj)
+    colnames(visual_coords) <- c("visual_1", "visual_2")
+    vis_coords_mat <- as.matrix(visual_coords)
+    cell_obj@reductions$visual <- CreateDimReducObject(key = "visual_",
+                                                       embeddings = vis_coords_mat,
+                                                       assay = "Spatial")
+    DefaultAssay(cell_obj) <- old_default_assay
+
+    return(cell_obj)
+}
+```
+</details>
+
+
+# Load libraries
+
+Load the R libraries required in the analysis. Also set some options for the
+generation of this document.
+
+```{r load_libraries, results = 'hide', message = FALSE, warning = FALSE}
+library(Seurat)
+library(sctransform)
+library(patchwork)
+library(viridis)
+library(ggplot2)
+library(cowplot)
+library(grid)
+library(ggpubr)
+library(ggrepel)
+library(openxlsx)
+library(DESeq2)
+library(scuttle)
+library(spacexr)
+library(fgsea)
+library(dplyr)
+library(tibble)
+library(reshape2)
+library(ggtext)
+library(knitr)
+library(msigdbr)
+library(showtext)
+library(ggforce)
+
+opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+               out.width = "75%")
+```
+
+Now set up some miscellaneous things that are important throughout:
+
+```{r misc}
+# Set to true if you want to run even slow sections
+compile_all <- TRUE
+
+fig_list <- list("fig_5" = list(), "fig_6" = list(), "fig_7" = list())
+
+main_figs_path <- "../paper_figs/main/"
+supp_figs_path <- "../paper_figs/supplementary/"
+
+fig_paths <- list("main" = main_figs_path, "supplementary" = supp_figs_path)
+
+output_figure_format <- ".pdf"
+# Width of A4 paper in cm
+a4_width <- 21
+
+# Override ggsave's new default black background color
+ggsave <- function(plot_obj, ..., bg = "white") {
+    print(plot_obj)
+    ggplot2::ggsave(..., bg = bg)
+}
+
+# Set correct font family and minimum text size:
+# First, load Arial using `showtext` library:
+font_add("Arial", "arial_unicode.ttf")
+font_add("ArialBold", "arial_bold.ttf")
+showtext_auto() # This line is important!!
+# Then override default theme and functions to enforce 11pt as a minimum and
+# Arial as the font family:
+# theme_grey is the default ggplot2 theme, and within it, the smallest text
+# size appears to be 0.8 * base_size. So, by setting base_size to 13.75, this
+# minimum becomes 11.
+pub_fig_theme <- theme_grey(base_size = 13.75) +
+                    theme(text = element_text(family = "Arial"),
+                          panel.background = element_rect(fill = "white", colour = NA))
+# and automatically apply this theme by default:
+theme_set(pub_fig_theme)
+
+# Overwrite ggplot2's annotate and geom_text functions:
+annotate <- function(..., size = 11, family = "Arial") {
+    ggplot2::annotate(..., size = size / .pt, family = family)
+}
+geom_text <- function(..., size = 11, family = "Arial") {
+    ggplot2::geom_text(..., size = size / .pt, family = family)
+}
+
+# Abbreviated sample names
+s_names_abbr <- list("PCW_7_REP_3" = "7 PCW", "PCW_11_REP_2" = "11 PCW",
+                     "PCW_17_REP_3" = "17 PCW",
+                     "Donor1_day40_dif2_org2" = "d40",
+                     "Donor2_day70_dif2_org2" = "d70",
+                     "Donor1_day120_dif1_org1" = "d120")
+```
+
+
+# Load data
+
+Load the datasets from file.
+
+```{r load_data, results = "hide"}
+cells <- list()
+samples <- c("OCT_BLOCK_1", "OCT_BLOCK_2", "OCT_BLOCK_3", "OCT_BLOCK_4",
+             "PC_AGE_1_REP_1", "PC_AGE_1_REP_2", "PC_AGE_1_REP_3",
+             "PC_AGE_2_REP_1", "PC_AGE_2_REP_2", "PC_AGE_2_REP_3",
+             "PC_AGE_3_REP_1", "PC_AGE_3_REP_2", "PC_AGE_3_REP_3",
+             "PC_AGE_4_REP_1", "PC_AGE_4_REP_2", "PC_AGE_4_REP_3")
+
+for (s in samples) {
+    dir_name <- paste0("../data/new_count_dirs/HGKFGDMXY_count_dirs/",
+                       s, "/outs")
+    # Load cell2location results for later use
+    file_name <- paste0("../data/cell2loc_results_docker_3/cell2location_results_",
+                        s, ".h5ad")
+    h5ad <- zellkonverter::readH5AD(file_name)
+
+    # Add timepoints to sample names
+    if (grepl("PC_AGE", s)) {
+        s <- sub("PC_AGE_1", "PCW_7", s)
+        s <- sub("PC_AGE_2", "PCW_11", s)
+        s <- sub("PC_AGE_3", "PCW_12", s)
+        s <- sub("PC_AGE_4", "PCW_17", s)
+    }
+
+    cells[[s]] <- Load10X_Spatial(data.dir = dir_name) %>%
+                  SCTransform(assay = "Spatial", verbose = FALSE) %>%
+                  RunPCA() %>%
+                  FindNeighbors(reduction = "pca")
+
+    for (ct in h5ad@metadata$mod$factor_names) {
+        ct_idx <- which(h5ad@metadata$mod$factor_names == ct)
+        # Use 5th percentile of posterior distributions, since (as per the
+        # documentation) this represents the value of cell abundance that the
+        # model has high confidence in (aka ‘at least this amount is present’)
+        # https://cell2location.readthedocs.io/en/latest/notebooks/cell2location_tutorial.html#Visualising-cell-abundance-in-spatial-coordinates
+
+        cells[[s]][[paste0("c2l_", ct)]] <- h5ad@metadata$mod$post_sample_q05$w_sf[, ct_idx]
+    }
+
+    cells[[s]] <- add_visual_reduction(cells[[s]])
+
+
+    message(paste("Loaded", s))
+}
+
+# Rotate main tissues
+cells$PCW_7_REP_3@misc$rot_angle <- 180
+cells$PCW_11_REP_2@misc$rot_angle <- 180
+cells$PCW_17_REP_3@misc$rot_angle <- 270
+
+# Rotate supplementary tissues
+cells$PCW_7_REP_1@misc$rot_angle <- 167
+cells$PCW_7_REP_2@misc$rot_angle <- 90
+cells$PCW_11_REP_1@misc$rot_angle <- 142
+cells$PCW_11_REP_3@misc$rot_angle <- 223
+cells$PCW_17_REP_1@misc$rot_angle <- 264
+cells$PCW_17_REP_2@misc$rot_angle <- 266
+```
+
+Later on, we will use lists of sample names that we want to include in the main
+or supplementary texts. We define these lists here.
+
+```{r define_sample_lists}
+nice_tissues <- c("PCW_7_REP_3", "PCW_11_REP_2", "PCW_17_REP_3")
+nice_organoids <- c("Donor1_day40_dif2_org2", "Donor2_day70_dif2_org2",
+                    "Donor1_day120_dif1_org1")
+nice_samples <- c(nice_tissues, nice_organoids)
+
+all_organoids <- names(cells)[grepl("Donor", names(cells))]
+
+all_tissues_list <- list()
+for (t in c(7, 11, 12, 17)) {
+    pcw_name <- paste0("PCW_", t)
+    all_tissues_list[[pcw_name]] <- paste0(pcw_name, paste0("_REP_", 1:3))
+}
+
+nice_tissues_list <- list("PCW_7" = "PCW_7_REP_3", "PCW_11" = "PCW_11_REP_2",
+                          "PCW_17" = "PCW_17_REP_3")
+
+all_organoids_list <- list()
+for (donor_day in list(c(1, 40), c(1, 70), c(1, 120),
+                       c(2, 40), c(2, 70), c(2, 120))) {
+    as_str <- paste0("Donor", donor_day[1], "_day", donor_day[2])
+    all_organoids_list[[as_str]] <- paste0(as_str,
+                                           c("_dif1_org1", "_dif1_org2",
+                                             "_dif2_org1", "_dif2_org2"))
+}
+
+supp_samples <- setdiff(as.character(c(unlist(all_tissues_list),
+                                       unlist(all_organoids_list))),
+                        nice_samples)
+
+samples_list <- list("main" = nice_samples, "supplementary" = supp_samples)
+```
+
+# Subset individial organoids
+
+We are now in a position to extract the different organoids from each capture
+area.  Since there are six organoids in each capture area, we must label them
+with the correct metadata. We do so by clustering the spatial co-ordinates of
+the spots into six clusters and then assigning the corresponding metadata.
+
+```{r subset_organoids}
+m <- matrix(, nrow = 24, ncol = 3)
+m[1, ] <- c("OCT_BLOCK_1", "0", "Donor2_day70_dif1_org2")
+m[2, ] <- c("OCT_BLOCK_1", "1", "Donor1_day40_dif2_org1")
+m[3, ] <- c("OCT_BLOCK_1", "2", "Donor2_day40_dif2_org2")
+m[4, ] <- c("OCT_BLOCK_1", "3", "Donor2_day120_dif1_org2")
+m[5, ] <- c("OCT_BLOCK_1", "4", "Donor2_day40_dif1_org1")
+m[6, ] <- c("OCT_BLOCK_1", "5", "Donor1_day120_dif2_org2")
+m[7, ] <- c("OCT_BLOCK_2", "0", "Donor2_day120_dif1_org1")
+m[8, ] <- c("OCT_BLOCK_2", "1", "Donor1_day120_dif1_org2")
+m[9, ] <- c("OCT_BLOCK_2", "2", "Donor2_day120_dif2_org2")
+m[10, ] <- c("OCT_BLOCK_2", "3", "Donor1_day70_dif2_org2")
+m[11, ] <- c("OCT_BLOCK_2", "4", "Donor1_day120_dif2_org1")
+m[12, ] <- c("OCT_BLOCK_2", "5", "Donor1_day40_dif2_org2")
+m[13, ] <- c("OCT_BLOCK_3", "0", "Donor1_day120_dif1_org1")
+m[14, ] <- c("OCT_BLOCK_3", "1", "Donor2_day70_dif2_org2")
+m[15, ] <- c("OCT_BLOCK_3", "2", "Donor2_day40_dif2_org1")
+m[16, ] <- c("OCT_BLOCK_3", "3", "Donor2_day40_dif1_org2")
+m[17, ] <- c("OCT_BLOCK_3", "4", "Donor2_day70_dif1_org1")
+m[18, ] <- c("OCT_BLOCK_3", "5", "Donor1_day40_dif1_org1")
+m[19, ] <- c("OCT_BLOCK_4", "0", "Donor1_day70_dif1_org1")
+m[20, ] <- c("OCT_BLOCK_4", "1", "Donor1_day70_dif1_org2")
+m[21, ] <- c("OCT_BLOCK_4", "2", "Donor2_day120_dif2_org1")
+m[22, ] <- c("OCT_BLOCK_4", "3", "Donor2_day70_dif2_org1")
+m[23, ] <- c("OCT_BLOCK_4", "4", "Donor1_day70_dif2_org1")
+m[24, ] <- c("OCT_BLOCK_4", "5", "Donor1_day40_dif1_org2")
+colnames(m) <- c("slide", "region", "sample_name")
+df <- data.frame(m)
+
+r <- data.frame(orig = c("dif1_org1", "dif1_org2", "dif2_org1", "dif2_org2"),
+                replacement = paste0("n", as.character(1:4)))
+
+for (s in c("OCT_BLOCK_1", "OCT_BLOCK_2", "OCT_BLOCK_3", "OCT_BLOCK_4")) {
+    DefaultAssay(cells[[s]]) <- "Spatial"
+    cells[[s]] <- add_visual_reduction(cells[[s]])
+
+    cells[[s]] <- cells[[s]] %>%
+                  FindNeighbors(dims = 1:2, reduction = "visual") %>%
+                  FindClusters(resolution = 0.3, verbose = FALSE)
+    if (s == "OCT_BLOCK_3") {
+        # Combine clusters 4 and 6 for OCT_BLOCK_3 as they are the same organoid
+        clust_6_idxs <- which(cells[[s]]$seurat_clusters == "6")
+        cells[[s]]$seurat_clusters[clust_6_idxs] <- "4"
+        cells[[s]]$seurat_clusters <- droplevels(cells[[s]]$seurat_clusters)
+        Idents(cells[[s]]) <- cells[[s]]$seurat_clusters
+    }
+
+    cells[[s]]$org_name <- "unknown"
+    for (i in levels(cells[[s]]$seurat_clusters)) {
+        organoid_name <- subset(df, slide == s & region == i)$sample_name
+        cells[[s]]$org_name[which(cells[[s]]$seurat_clusters == i)] <- organoid_name
+        cells[[organoid_name]] <- subset(cells[[s]], seurat_clusters == i)
+    }
+
+    df_vis <- as.data.frame(cells[[s]]@reductions$visual@cell.embeddings)
+    df_vis$seurat_clusters <- cells[[s]]$seurat_clusters
+    new_visual_1 <- -1 * df_vis$visual_1
+    # Flip y axis:
+    df_vis$visual_1 <- new_visual_1 + (min(df_vis$visual_1) - min(new_visual_1))
+    df_vis$ident <- NA
+
+    cluster_means <- lapply(unique(df_vis$seurat_clusters),
+                            function(x) {
+                                subset(df_vis, seurat_clusters == x)[, -3] %>%
+                                    apply(2, mean)
+                            }) %>%
+                        do.call(rbind, .)
+    rownames(cluster_means) <- unique(df_vis$seurat_clusters)
+    cluster_means <- as.data.frame(cluster_means)
+    cluster_means$cluster_name <- rownames(cluster_means)
+    cluster_means$ident <- NA
+    for (i in cluster_means$cluster_name) {
+        old_name <- subset(df, slide == s & region == i)$sample_name
+        prefix <- substr(old_name, 1, nchar(old_name) - 9)
+        old_suffix <- substr(old_name, nchar(old_name) - 8, nchar(old_name))
+        new_suffix <- r[r$orig == old_suffix, "replacement"]
+        new_name <- paste0(prefix, new_suffix)
+        cluster_means[cluster_means$cluster_name == i, ]$cluster_name <- new_name
+    }
+
+    cluster_means_all_dots <- df_vis[, c("visual_1", "visual_2", "ident")]
+    cluster_means_all_dots$cluster_name <- ""
+    combined_df <- rbind(cluster_means, cluster_means_all_dots)
+    p1 <- SpatialDimPlot(cells[[s]], pt.size.factor = 1, stroke = 0,
+                         alpha = 0.6) +
+            geom_point(data = df_vis, aes(x = visual_2, y = visual_1),
+                       alpha = 0) +
+            coord_cartesian(clip = "off") +
+            geom_label_repel(data = combined_df,
+                             aes(x = visual_2, y = visual_1,
+                                 label = cluster_name),
+                             max.overlaps = 10000, force = 50,
+                             xlim = c(-Inf, Inf), ylim = c(-Inf, Inf),
+                             fill = "white", direction = "both") +
+            scale_x_continuous(expand = expansion(mult = 0.5)) +
+            scale_y_continuous(expand = expansion(mult = 0.5)) +
+            theme(legend.position = "none")
+
+    p2 <- SpatialDimPlot(cells[[s]], alpha = 0) +
+            theme(legend.position = "none")
+
+    p <- ggarrange(p2, p1, nrow = 1, widths = c(1, 2.5))
+    p <- annotate_figure(p, top = text_grob(s))
+
+    fig_name <- paste0("organoid_names_", s)
+    ggsave(p, filename = paste0(supp_figs_path, fig_name, output_figure_format),
+           dpi = 300, width = 20, height = 10, units = "cm")
+
+    print(p)
+}
+```
+
+# Remove outlier spots
+
+```{r remove_spots}
+for (s in c("PCW_7_REP_3", "PCW_11_REP_2", "Donor2_day70_dif2_org2")) {
+    x <- cells[[s]]@reductions$visual@cell.embeddings[, 2]
+    y <- cells[[s]]@reductions$visual@cell.embeddings[, 1]
+
+    if (s == "PCW_7_REP_3") {
+        is_outlier <- ((y + x) < 380) & (y < 180)
+    } else if (s == "PCW_11_REP_2") {
+        is_outlier <- (y < 150)
+    } else if (s == "Donor2_day70_dif2_org2") {
+        is_outlier <- ((0.8 * x) + y) > 578
+    }
+
+    cells[[s]][["is_outlier"]] <- is_outlier
+    cells[[s]] <- subset(cells[[s]], is_outlier == FALSE)
+}
+```
+
+# Process main samples
+
+```{r process_main_samples}
+# for (s in nice_samples) {
+# organoids which cause a crash in the chunk below:
+bad_organoids <- c("Donor2_day40_dif1_org1", "Donor1_day120_dif2_org2")
+for (s in setdiff(names(cells), bad_organoids)) {
+    message(s)
+    cells[[s]] <- SCTransform(cells[[s]], assay = "Spatial",
+                              verbose = FALSE) %>%
+                    RunPCA() %>%
+                    FindNeighbors(reduction = "pca", dims = 1:10)
+}
+```
+
+# Plot Cell2Location outputs
+
+```{r plot_c2l_supp}
+nice_ct_names <- list()
+nice_ct_names[["c2l_Astro"]] <- "Astrocyte"
+nice_ct_names[["c2l_Eryth"]] <- "Erythrocyte"
+nice_ct_names[["c2l_OPC_1"]] <- "Oligodendrocyte precursor 1"
+nice_ct_names[["c2l_OPC_2"]] <- "Oligodendrocyte precursor 2"
+nice_ct_names[["c2l_Unk"]] <- "Unknown"
+nice_ct_names[["c2l_VascLepto"]] <- "Vascular Lepto???"
+nice_ct_names[["c2l_hDA1a"]] <- "Dopaminergic Neurons 1a"
+nice_ct_names[["c2l_hDA1b"]] <- "Dopaminergic Neurons 1b"
+nice_ct_names[["c2l_hDA2"]] <- "Dopaminergic Neurons 2"
+nice_ct_names[["c2l_hDA3/hGABA/hSer"]] <- "Dopaminergic Neurons 3"
+nice_ct_names[["c2l_hEndo"]] <- "Endothelial"
+nice_ct_names[["c2l_hMgl"]] <- "Microglia"
+nice_ct_names[["c2l_hMidPre"]] <- "Midbrain precursor"
+nice_ct_names[["c2l_hNPro"]] <- "Neuron progenitor"
+nice_ct_names[["c2l_hNbDA"]] <- "Dopaminergic neuroblast"
+nice_ct_names[["c2l_hNbGaba"]] <- "GABA-ergic neuroblast"
+nice_ct_names[["c2l_hPeric"]] <- "Pericyte"
+nice_ct_names[["c2l_hPreDA"]] <- "Dopaminergic Neuron Precursor"
+nice_ct_names[["c2l_hProgFPM"]] <- "Post-mitotic progentior???"
+nice_ct_names[["c2l_hProgM"]] <- "Mitotic progenitor???"
+nice_ct_names[["c2l_hRgl1"]] <- "Radial glial 1"
+nice_ct_names[["c2l_hRgl2/immAstro"]] <- "Radial glial 2 / astrocyte???"
+nice_ct_names[["c2l_hRgl3_caudal"]] <- "Radial glial 3 / caudal"
+nice_ct_names[["c2l_hRgl4/MultiEpend"]] <- "Radial glial 4 / Ependyma???"
+
+beautify_ct_plot <- function(p, plot_title = NULL) {
+    p <- p + theme(legend.position = "right",
+              legend.title = element_blank(),
+              legend.text = element_blank(),
+              plot.title = element_text(size = 8, hjust = 0.5)) +
+        scale_fill_viridis_c() +
+        guides(fill = guide_colorbar(ticks.colour = NA,
+                                     barwidth = 0.5,
+                                     barheight = 3)) +
+        ggtitle(plot_title)
+    p_spots <- p + theme(legend.position = "none")
+    p_dat <- p$data
+    c2l_col <- grep("c2l_", colnames(p_dat), value = TRUE)
+    c2l_dat <- p_dat[, c2l_col]
+    ct_max <- sprintf("%.1f", max(c2l_dat))
+    p_leg <- as_ggplot(get_legend(p)) +
+                    annotate(geom = "text", x = 0.45, y = 0.75,
+                             label = ct_max) +
+                    theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+    p_spots <- FixSpatialPlot(p_spots)
+    p <- ggarrange(ggplot() + theme_void(), p_spots, p_leg,
+                   ggplot() + theme_void(), nrow = 1,
+                   widths = c(0.1, 0.6, 0.2, 0.1))
+
+    return(p)
+}
+```
+
+```{r plot_c2l_main}
+# Rename the slice's image to the sample name
+for (s in nice_samples) {
+    cells[[s]]@images[[s]] <- cells[[s]]@images[["slice1"]]
+    cells[[s]]@images[["slice1"]] <- NULL
+}
+
+cells$merged_nice_samples <- merge(x = cells[[nice_samples[1]]],
+                                   y = cells[nice_samples[2:length(nice_samples)]])
+
+sample_names <- names(cells$merged_nice_samples@images)
+num_samples <- length(sample_names)
+
+custom_marker_plot <- function(m_plot, m_name) {
+    m_plot <- m_plot +
+                ggtitle(m_name) +
+                theme(legend.position = "none",
+                      plot.title = element_text(size = 7, hjust = 0.5,
+                                                margin = margin(b = 0, unit = "cm"))) +
+                guides(fill = guide_colorbar(label.vjust = -6,
+                                             label.hjust = 1,
+                                             label.position = "top",
+                                             title.vjust = 0.2,
+                                             ticks.colour = NA)) +
+                scale_fill_gradient(low = "white", high = "red")
+
+    return(m_plot)
+}
+
+marks_and_cts_list <- list()
+marks_and_cts_list[[1]] <- list("c2l_hRgl1" = c("HES5", "OTX2"),
+                                "c2l_hDA2" = c("TH", "KCNJ6"))
+marks_and_cts_list[[2]] <- list("c2l_hNbDA" = c("DCX", "EBF2"),
+                                "c2l_hDA1a" = c("TH", "LMO3"),
+                                "c2l_hDA1b" = c("TH", "LMO3"),
+                                "c2l_hDA2" = c("TH", "DDC"),
+                                "c2l_hDA3/hGABA/hSer" = c("ALDH1A1", "KCNJ6"))
+names(marks_and_cts_list) <- c("main", "supplementary")
+
+for (ct_class in names(marks_and_cts_list)) {
+    marks_and_cts <- marks_and_cts_list[[ct_class]]
+    plot_list <- list()
+    sample_names_plots <- lapply(s_names_abbr[Images(cells$merged_nice_samples)],
+                                 function(sample_name) {
+                                     ggplot() +
+                                         annotate(geom = "text", x = 0, y = 0,
+                                                  label = sample_name,
+                                                  family = "ArialBold") +
+                                         theme_void()
+                                 })
+    sample_names_plots_combined <- wrap_plots(sample_names_plots, nrow = 1)
+    ct_name_width <- 0.8
+    plot_list_widths <- c(ct_name_width, rep(1, num_samples))
+
+    plot_list[["first_row"]] <- ggplot() + theme_void()
+    plot_list[["sample_names"]] <- wrap_plots(ggplot() + theme_void(),
+                                              sample_names_plots_combined,
+                                              nrow = 1,
+                                              widths = c(plot_list_widths[1],
+                                                         sum(plot_list_widths[-1])))
+    bottom_left <- "#000000"
+    bottom_right <- "#0000FF"
+    top_left <- "#FF0000"
+    top_right <- "#FFFF00"
+
+    for (ct in unique(names(marks_and_cts))) {
+        to_plot <- c(ct, marks_and_cts[which(names(marks_and_cts) == ct)][[1]])
+        # plot_list_inner arranged as: 1-6: CT plots; 7-12: M1 plots; 13-18: M2 plots
+        to_plot_fix <- gsub("/", ".", to_plot)
+        plot_list_inner <- SpatialFeaturePlot(cells$merged_nice_samples,
+                                              to_plot_fix, stroke = NA,
+                                              combine = FALSE)
+        plot_list_inner_names <- apply(expand.grid(Images(cells$merged_nice_samples),
+                                                   to_plot_fix),
+                                       1,
+                                       function(x) {
+                                           paste0(x[1], "_", x[2])
+                                       })
+        names(plot_list_inner) <- plot_list_inner_names
+
+        plot_list_mid <- list()
+        ct_sub <- substr(ct, 5, nchar(ct))
+        # Add newlines after dashes
+        ct_sub <- gsub("/", "/\n", ct_sub)
+        line_x <- 0.9
+        plot_list_mid[["ct_name"]] <- ggplot() +
+                                        xlim(-1, 1) +
+                                        ylim(-1, 1) +
+                                        annotate(geom = "text", x = 0, y = 0.5,
+                                                 label = ct_sub, hjust = 0.5,
+                                                 family = "ArialBold") +
+                                        annotate(geom = "text", x = 0,
+                                                 y = -0.4, label = to_plot[2],
+                                                 hjust = 0.5, color = "red",
+                                                 size = 8) +
+                                        annotate(geom = "text", x = 0,
+                                                 y = -0.6, label = to_plot[3],
+                                                 hjust = 0.5, color = "blue",
+                                                 size = 8) +
+                                        geom_segment(aes(x = line_x,
+                                                         xend = line_x,
+                                                         y = -1, yend = 1)) +
+                                        geom_segment(aes(x = line_x - 0.1,
+                                                         xend = line_x,
+                                                         y = 0.5,
+                                                         yend = 0.5)) +
+                                        theme_void()
+
+        for (sample_idx in seq(num_samples)) {
+            sample_name <- nice_samples[sample_idx]
+            ct_plot <- plot_list_inner[[paste0(sample_name, "_",
+                                               to_plot_fix[1])]]
+
+            ct_max <- round(max(cells[[sample_name]][[to_plot[1]]]), 1)
+            plot_margin <- unit(c(0, 0, 0, 0), "cm")
+            ct_plot <- ct_plot +
+                  theme(legend.position = "none",
+                        legend.background = element_blank(),
+                        legend.title = element_text(size = 5, hjust = 0),
+                        legend.text = element_blank(),
+                        plot.title = element_blank(),
+                        plot.margin = plot_margin,
+                        plot.background = element_blank()) +
+                  scale_fill_viridis_c() +
+                  labs(fill = paste(ct_max, "   ")) +
+                  guides(fill = guide_colorbar(ticks.colour = NA,
+                                               barwidth = 0.3,
+                                               barheight = 1))
+
+            ct_plot <- FixSpatialPlot(ct_plot)
+
+            sfpbs <- SpatialFeaturePlotBlend(cells[[sample_name]],
+                                             column_1 = to_plot[2],
+                                             column_2 = to_plot[3],
+                                             stroke = NA, combine = FALSE)
+            marker_plots <- sfpbs[[3]] +
+                                theme(plot.title = element_blank(),
+                                      plot.margin = plot_margin,
+                                      plot.background = element_blank())
+            marker_plots <- FixSpatialPlot(marker_plots,
+                                           sample_name = sample_name)
+
+            p <- wrap_plots(ct_plot, marker_plots, ncol = 1)
+            plot_list_mid[[sample_idx + 1]] <- p
+        }
+        plot_list[[ct]] <- wrap_plots(plot_list_mid, nrow = 1,
+                                      widths = c(ct_name_width,
+                                                 rep(1, num_samples)))
+    }
+
+    plot_list[["last_row"]] <- ggplot() + theme_void()
+
+    heights_list <- list("main" = c(-0.4, 0.5, 4, 4, -1.3),
+                         "supplementary" = c(-0.4, 0.5, 4, 4, 4, 4, 4, -1.3))
+    p <- wrap_plots(plot_list, ncol = 1, heights = heights_list[[ct_class]])
+
+    sfpb_leg <- sfpbs[[4]][[2]]
+    x_min_max <- as.numeric(quantile(sfpb_leg$data[, 1], c(0, 1)))
+    y_min_max <- as.numeric(quantile(sfpb_leg$data[, 2], c(0, 1)))
+
+    sfpb_leg <- sfpb_leg +
+                    theme(axis.ticks = element_blank(),
+                          axis.title.x = element_text(color = bottom_right,
+                                                      size = 8, vjust = 0.5),
+                          axis.title.y = element_text(color = top_left,
+                                                      size = 8, vjust = 0.5),
+                          axis.text = element_text(size = 8)) +
+                    xlab("Gene 1") +
+                    ylab("Gene 2") +
+                    scale_x_continuous(breaks = x_min_max,
+                                       labels = c("Low", "High")) +
+                    scale_y_continuous(breaks = y_min_max,
+                                       labels = c("Low", "High"))
+
+    p <- wrap_plots(p, sfpb_leg, nrow = 1, widths = c(0.9, 0.1))
+
+    file_name <- paste0(fig_paths[[ct_class]], "c2l_combined_",
+                        ct_class, output_figure_format)
+    ggsave(p, filename = file_name, units = "cm", dpi = 300, width = a4_width,
+           height = ifelse(ct_class == "main", 12, 30))
+
+    if (ct_class == "main") {
+        fig_list$fig_5[["c2l_combined_main"]] <- p
+        fig_list$fig_5$row_1 <- p
+    }
+}
+```
+
+```{r more_supp_c2l_plots}
+main_c2l <- c("c2l_hRgl1", "c2l_hProgFPM", "c2l_hNbDA", "c2l_hPreDA",
+              "c2l_hDA1a", "c2l_hDA1b", "c2l_hDA2", "c2l_hDA3/hGABA/hSer")
+supp_c2l_1 <- c("c2l_hRgl2/immAstro", "c2l_hRgl3_caudal",
+                "c2l_hRgl4/MultiEpend", "c2l_hMidPre", "c2l_hNPro",
+                "c2l_hProgM", "c2l_hNbGaba", "c2l_Astro")
+supp_c2l_2 <- c("c2l_OPC_1", "c2l_OPC_2", "c2l_hMgl", "c2l_hEndo",
+                "c2l_hPeric", "c2l_Eryth", "c2l_VascLepto", "c2l_Unk")
+c2l_cts <- list("main" = list("main" = main_c2l),
+                "supplementary" = list("supplementary_1" = supp_c2l_1,
+                                       "supplementary_2" = supp_c2l_2))
+
+strip_prefix <- function(x) {
+    substr(x, 5, nchar(x))
+}
+
+c2l_cts_pretty <- lapply(c2l_cts, function(x) {lapply(x, strip_prefix)})
+names(c2l_cts_pretty$main$main) <- main_c2l
+names(c2l_cts_pretty$supplementary$supplementary_1) <- supp_c2l_1
+names(c2l_cts_pretty$supplementary$supplementary_2) <- supp_c2l_2
+
+fig_paths <- list("main" = main_figs_path, "supplementary" = supp_figs_path)
+
+sample_group <- "supplementary"
+for (ct_group in names(c2l_cts[[sample_group]])) {
+    cts <- c2l_cts[[sample_group]][[ct_group]]
+    plot_list_outer <- list()
+    pretty_ct_names <- c2l_cts_pretty[[sample_group]][[ct_group]]
+    ct_names_plots <- lapply(cts,
+                             function(ct) {
+                                 ggplot() +
+                                     annotate("text", x = 0, y = 0, size = 8,
+                                              label = pretty_ct_names[[ct]],
+                                              angle = 90) +
+                                     theme_void()
+                             })
+    plot_list_outer[["ct_names"]] <- wrap_plots(ct_names_plots, ncol = 1)
+    num_cts <- length(cts)
+    num_samples <- length(nice_samples)
+    for (s in nice_samples) {
+        plot_list <- lapply(cts,
+                            function(cell_type) {
+                                p <- SpatialFeaturePlot(cells[[s]],
+                                                        cell_type,
+                                                        image.alpha = 0) +
+                                        theme(legend.position = "none",
+                                              plot.title = element_blank(),
+                                              plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+                                    scale_fill_viridis_c()
+                                p <- FixSpatialPlot(p, sample_name = s, num_cells = ncol(cells[[s]]))
+                                if (cell_type == cts[1]) {
+                                    p_s <- ggplot() +
+                                     annotate("text", x = 0, y = 0,
+                                              size = 8,
+                                              label = s_names_abbr[[s]]) +
+                                     theme_void()
+                                    p <- wrap_plots(p_s, p, ncol = 1,
+                                                    heights = c(0.1, 0.9))
+                                }
+                                return(p)
+                            })
+        plot_list_outer[[s]] <- wrap_plots(plot_list, ncol = 1,
+                                           nrow = num_cts)
+    }
+    title_percentage <- 5
+    widths <- c(title_percentage,
+                 rep((100 - title_percentage) / num_samples, num_samples))
+    p <- wrap_plots(plot_list_outer, nrow = 1, ncol = num_samples + 1,
+                    widths = widths)
+    f_name <- paste0(fig_paths[[sample_group]], "c2l_combined_",
+                     ct_group, "_no_markers", output_figure_format)
+    ggsave(p, filename = f_name, dpi = 300, width = a4_width,
+           height = 29.7, units = "cm", limitsize = FALSE)
+}
+
+p <- SpatialFeaturePlot(cells[[s]], c2l_cts[[sample_group]][[ct_group]][1]) +
+        scale_fill_viridis_c(breaks = c(0.05, 0.33),
+                             labels = c("Low", "High")) +
+        theme(legend.title = element_blank()) +
+        guides(fill = guide_colourbar(ticks.colour = NA))
+p <- cowplot::get_legend(p) %>% as_ggplot()
+ggsave(p,
+       filename = paste0(fig_paths[["supplementary"]],
+                         "c2l_supp_legend", output_figure_format),
+       dpi = 300, units = "cm", height = 2, width = 4)
+```
+
+# RNA molecule plots
+
+```{r rna_molecule_plots}
+braun_genes <- c("STMN2", "NKX2-1", "NKX2-2", "BARHL1", "SHH", "EN2", "EMX2",
+                 "WNT5A")
+colors_to_use <- c("#FFBFCC", "#77AADD", "#EE8866", "#F2DC6B", "#99DDFF",
+                   "#44BB99", "#BBCC33", "#8C8C8C")
+names(colors_to_use) <- braun_genes
+
+generate_molecule_plot <- function(obj, genes, cols) {
+    ad <- GetAssayData(obj, assay = "Spatial", layer = "counts")
+    p <- SpatialFeaturePlot(obj, features = "TH", alpha = 0)
+    p_data <- p[[1]]$data
+
+    df <- data.frame(matrix(ncol = 0, nrow = 0))
+    for (g in genes) {
+        gt_0_spots <- names(which(ad[g, ] > 0))
+        gt_0_expr <- ad[g, gt_0_spots]
+        gt_0_spots_duped <- rep(gt_0_spots, gt_0_expr)
+        if (length(gt_0_spots) > 0) {
+            new_rows <- cbind(p_data[gt_0_spots_duped, c("imagecol", "imagerow")],
+                              gene = g, "TH" = 0)
+            df <- rbind(df, new_rows)
+        }
+    }
+
+    df$imagerow_flip <- max(df$imagerow) + (-1 * df$imagerow)
+    df$gene <- factor(df$gene, levels = genes)
+    p <- SpatialFeaturePlot(obj, features = "TH", alpha = 0,
+                            image.alpha = 0.5) +
+    geom_point(data = df, aes(x = imagecol, y = imagerow_flip,
+                              color = gene),
+               position = position_jitter(width = 3, height = 3,
+                                          seed = 123),
+               alpha = 1, size = 0, stroke = 0.2, show.legend = TRUE) +
+    scale_color_manual(values = cols, drop = FALSE) +
+    guides(fill = "none",
+           color = guide_legend(override.aes = list(size = 3), ncol = 2)) +
+    theme(legend.title = element_blank(),
+          legend.position = "right",
+          legend.key = element_rect(fill = NA))
+
+    return(p)
+}
+
+p_for_legend <- generate_molecule_plot(cells[[nice_samples[1]]], braun_genes,
+                                       colors_to_use)
+leg <- as_ggplot(get_legend(p_for_legend))
+
+arrow_plot <- ggplot() +
+                geom_segment(aes(x = 0, xend = 0, y = -0.25, yend = 0.25),
+                             arrow = arrow(length = unit(0.25, "cm"),
+                                           ends = "both",
+                                           type = "closed")) +
+                annotate("text", x = 0, y = 0.4, label = "D") +
+                annotate("text", x = 0, y = -0.4, label = "V") +
+                scale_x_continuous(limits = c(-1, 1)) +
+                scale_y_continuous(limits = c(-1, 1)) +
+                theme_void()
+
+plot_list <- list()
+for (s in nice_tissues) {
+    p <- generate_molecule_plot(cells[[s]], braun_genes, colors_to_use)
+    p <- p + theme(legend.position = "none")
+    p <- rotate_image(p, cells[[s]]@misc$rot_angle) %>%
+            annotate_figure(top = text_grob(s_names_abbr[[s]],
+                                            size = 11,
+                                            family = "ArialBold",
+                                            vjust = 1.5,
+                                            hjust = 0.3))
+    plot_list[[s]] <- p
+}
+p <- ggarrange(plotlist = plot_list, nrow = 1)
+p_complete <- ggarrange(ggplot() + theme_void(), arrow_plot, p, leg,
+                        ggplot() + theme_void(), nrow = 1,
+                        widths = c(3, 1, 14, 7, 3))
+
+fig_list$fig_5$molecules <- p_complete
+fig_list$fig_5$row_4 <- p_complete
+
+f_name <- paste0(fig_paths[["main"]], "molecule_plots", output_figure_format)
+ggsave(p_complete, filename = f_name, width = a4_width - 3,
+       height = 4, units = "cm")
+```
+
+# Supergroups
+
+Carry out clustering and then plot the expression some general marker genes with respect to these clusters
+
+```{r supergroups}
+nice_samples <- nice_samples[grep(pattern = "OCT_", x = nice_samples, invert = TRUE)]
+marks_list <- list("Progenitor" = c("HES1", "SOX2", "VIM"),
+                   "Post-mitotic" = c("TH", "DCX", "MAP2"))
+num_clusters <- 2
+
+cluster_res_list <- list()
+cluster_res_list[["PCW_7_REP_3"]] <- list("2" = 0.05, "3" = 0.1)
+cluster_res_list[["PCW_11_REP_2"]] <- list("2" = 0.045, "3" = 0.08)
+cluster_res_list[["PCW_17_REP_3"]] <- list("2" = 0.04, "3" = 0.05)
+cluster_res_list[["Donor1_day40_dif2_org2"]] <- list("2" = 0.3)
+cluster_res_list[["Donor2_day70_dif2_org2"]] <- list("2" = 0.4)
+cluster_res_list[["Donor1_day120_dif1_org1"]] <- list("2" = 0.2)
+
+plot_list_spatial <- list()
+plot_list_dotplot <- list()
+for (s in nice_samples) {
+    DefaultAssay(cells[[s]]) <- "SCT"
+    res <- cluster_res_list[[s]][[as.character(num_clusters)]]
+    if (!is.null(res)) {
+        cells[[s]] <- FindClusters(cells[[s]], resolution = res)
+    } else {
+        res <- 0.01
+        cells[[s]] <- FindClusters(cells[[s]], resolution = res)
+        while (length(levels(cells[[s]]$seurat_clusters)) < 2) {
+            res <- res + 0.01
+            cells[[s]] <- FindClusters(cells[[s]], resolution = res)
+        }
+    }
+
+    cells[[s]]$cluster_ident <- as.character(cells[[s]]$seurat_clusters)
+    zero_idxs <- as.numeric(which(cells[[s]]$cluster_ident == "0"))
+    avg_vim_zeroes <- mean(GetAssayData(cells[[s]])["VIM", zero_idxs])
+    avg_vim_non_zeroes <- mean(GetAssayData(cells[[s]])["VIM", -zero_idxs])
+
+    if ((!is.nan(avg_vim_zeroes)) && (avg_vim_zeroes > avg_vim_non_zeroes)) {
+        cells[[s]]$cluster_ident[zero_idxs] <- "Progenitor"
+        cells[[s]]$cluster_ident[-zero_idxs] <- "Post-mitotic"
+    } else {
+        cells[[s]]$cluster_ident[zero_idxs] <- "Post-mitotic"
+        cells[[s]]$cluster_ident[-zero_idxs] <- "Progenitor"
+    }
+    cells[[s]]$cluster_ident <- factor(cells[[s]]$cluster_ident,
+                                       levels = names(marks_list))
+    Idents(cells[[s]]) <- cells[[s]]$cluster_ident
+
+    cluster_color_list <- list("Progenitor" = "#5B9EDA",
+                               "Post-mitotic" = "#D05280")
+
+    marks_color_list <- lapply(names(marks_list),
+                               function(x) {
+                                   rep(cluster_color_list[[x]],
+                                       length(marks_list[[x]]))
+                               })
+    marks_colors <- unlist(marks_color_list)
+
+    p1 <- SpatialDimPlot(cells[[s]], stroke = NA) +
+            scale_fill_manual(values = lapply(levels(Idents(cells[[s]])),
+                                              function(x) {
+                                                  cluster_color_list[[x]]
+                                              })) +
+            theme(legend.position = "none")
+    p1 <- FixSpatialPlot(p1, sample_name = s, num_cells = ncol(cells[[s]]))
+    plot_list_spatial[[s]] <- p1 %>% annotate_figure(top = text_grob(s_names_abbr[[s]],
+                                                                     size = 11,
+                                                                     family = "ArialBold",
+                                                                     vjust = 1.5))
+
+    y_axis_order <- levels(Idents(cells[[s]]))
+    cluster_colors <- as.character(unlist(cluster_color_list[y_axis_order]))
+        cols_to_use <- c("#FFFFFF", "#000000")
+    p2 <- DotPlot(cells[[s]], features = as.character(unlist(marks_list)),
+                  assay = "Spatial", scale = FALSE, dot.scale = 4) +
+            theme(axis.title = element_blank(),
+                  legend.title = element_blank(),
+                  strip.text = element_blank(),
+                  axis.text.x = element_markdown(angle = 90, hjust = 1,
+                                                 color = marks_colors, size = 8),
+                  axis.text.y = element_markdown(size = 11,
+                                                 color = cluster_colors),
+                  legend.key.height = unit(0.2, 'cm'),
+                  plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+            ylab("Cluster") +
+            scale_y_discrete(limits = y_axis_order)
+    max_val <- max(p2$data$avg.exp.scaled)
+    min_val <- min(p2$data$avg.exp.scaled)
+    p2 <- p2 + scale_color_gradientn(colours = c("#FFFFFF", "#000000"),
+                                     breaks = (max_val - min_val) * c(0.1, 0.9),
+                                     labels = c("Low", "High")) +
+            guides(color = guide_colourbar(ticks.colour = NA, barwidth = 0.4))
+
+    if (s != nice_samples[1]) {
+        p2 <- p2 + theme(axis.text.y = element_blank(),
+                         axis.line.y = element_blank(),
+                         axis.ticks.y = element_blank())
+    }
+
+    if (s != nice_samples[length(nice_samples)]) {
+        p2 <- p2 + theme(legend.position = "none")
+    }
+
+    plot_list_dotplot[[s]] <- p2
+}
+
+spatial_widths <- rep(1, length(plot_list_spatial))
+spatial_plots <- wrap_plots(plot_list_spatial, nrow = 1, widths = spatial_widths)
+
+dotplot_widths <- rep(1, length(plot_list_dotplot))
+dotplot_widths[1] <- 1
+dotplot_widths[length(dotplot_widths)] <- 1
+dotplots <- wrap_plots(plot_list_dotplot, nrow = 1, widths = dotplot_widths) & theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+p <- wrap_plots(spatial_plots, dotplots, ncol = 1, heights = c(0.8, 0.3))
+
+fig_name <- "supergroups"
+
+fig_list$fig_5$supergroups <- p
+fig_list$fig_5$row_3 <- p
+ggsave(p, filename = paste0(main_figs_path, fig_name,
+                            output_figure_format),
+       dpi = 300, width = a4_width, height = 8, units = "cm", limitsize = FALSE)
+```
+
+# Differential Expression with CSIDE
+
+The CSIDE software allows us to identify differentially expressed genes with
+respect to some covariate (in our case, maturation). We run it below, first
+loading the cell2location deconvolution results.
+
+## Create reference object
+
+```{r de_with_cside}
+pau_cells <- readRDS("../data/mlo_resolution075_Annot.RDS")
+
+cluster_names <- c(0:23)
+names(cluster_names) <- c("hRgl2/immAstro", "hNbDA", "hProgFPM", "OPC_1",
+                          "VascLepto", "hDA1b", "hRgl1", "hDA1a",
+                          "hRgl3_caudal", "hDA2", "hProgM", "hPreDA",
+                          "hMidPre", "hMgl", "hEndo", "hNbGaba", "hNPro",
+                          "hDA3/hGABA/hSer", "Unk", "hRgl4/MultiEpend",
+                          "Astro", "hPeric", "Eryth", "OPC_2")
+pau_cells$seurat_clusters_24_Annot <- names(cluster_names[pau_cells$seurat_clusters])
+
+# Following https://satijalab.org/seurat/articles/spatial_vignette.html#spatial-deconvolution-using-rctd
+ref <- pau_cells
+ref <- UpdateSeuratObject(ref)
+counts <- ref[["RNA"]]$counts
+ref$seurat_clusters_24_Annot <- gsub("/", "_", ref$seurat_clusters_24_Annot)
+Idents(ref) <- "seurat_clusters_24_Annot"
+cluster <- as.factor(ref$seurat_clusters_24_Annot)
+
+names(cluster) <- colnames(ref)
+nUMI <- ref$nCount_RNA
+names(nUMI) <- colnames(ref)
+reference <- Reference(counts, cluster, nUMI)
+
+rm(pau_cells)
+rm(ref)
+rm(counts)
+gc()
+```
+
+Now we are ready to run CSIDE.
+
+```{r cside_with_c2l}
+convert_to_spatial_rna <- function(s) {
+    coords <- GetTissueCoordinates(s)
+    colnames(coords) <- c("x", "y")
+    coords[is.na(colnames(coords))] <- NULL
+    counts <- s[["Spatial"]]$counts
+
+    return(SpatialRNA(coords, counts, colSums(counts)))
+}
+
+run_cside <- function(cell_obj, reference, sample_name, exp_var_name = "maturation_path", exp_var_id_1 = NULL) {
+    RCTD <- create.RCTD(convert_to_spatial_rna(cell_obj),
+                        reference = reference, max_cores = 1,
+                        CELL_MIN_INSTANCE = 15)
+
+    # The two lines are slightly hacky ways around bugs in CSIDE. Cell2Location
+    # effectively runs in  full mode (in the terminology of RCTD)
+    RCTD@config$RCTDmode <- "full"
+    RCTD@config$doublet_mode <- FALSE
+
+    c2l_weights <- cell_obj@meta.data[, grepl("^c2l", colnames(cell_obj@meta.data))]
+    c2l_weights <- normalize_weights(c2l_weights)
+    colnames(c2l_weights) <- gsub("/", "_", colnames(c2l_weights))
+    colnames(c2l_weights) <- gsub("c2l_", "", colnames(c2l_weights))
+
+    RCTD <- import_weights(RCTD, c2l_weights)
+    RCTD <- set_cell_types_assigned(RCTD)
+
+    if (exp_var_name == "maturation_path") {
+        exp_var <- cell_obj$maturation
+    } else if (exp_var_name == "mat_region") {
+        exp_var <- as.integer(cell_obj[["mat_region"]] == exp_var_id_1)
+    }
+    names(exp_var) <- colnames(cell_obj)
+
+    # Setting weight_threshold and cell_type_threshold much lower than their
+    # default values in CSIDE, otherwise it crashes. This change is probably
+    # required because cell2location is likely to generate much smaller weights
+    # than RCTD as it assumes more cells per spot.
+    cside_out <- run.CSIDE.single(RCTD, exp_var,
+                                  doublet_mode = FALSE,
+                                  weight_threshold = 0.2,
+                                  cell_type_threshold = 1,
+                                  fdr = 0.05)
+
+    if (!is.null(sample_name)) {
+        # Generate combined spreadsheet
+        res <- cside_out@de_results$all_gene_list
+        res <- res[which(unlist(lapply(res, nrow)) > 0)]
+        for (ct in names(res)) {
+            res[[ct]] <- cbind(gene = rownames(res[[ct]]), res[[ct]],
+                               cell_type = ct)
+            is_sig <- res[[ct]]$gene %in% rownames(cside_out@de_results$sig_gene_list[[ct]])
+            res[[ct]]$is_signif <- is_sig
+        }
+        cside_out_merged <- do.call(rbind, res)
+    }
+
+    return(cside_out_merged)
+}
+```
+
+We now define the maturaion covariates according to the anatomy of the tissue
+slices.
+
+```{r define_maturations, message = FALSE}
+# Define PCW_11_REP_2 maturation
+
+cells$PCW_11_REP_2 <- add_visual_reduction(cells$PCW_11_REP_2)
+
+vis_emb <- cells$PCW_11_REP_2@reductions$visual@cell.embeddings
+# Need to shift coords here to centre the axes at the correct point
+x_coord <- vis_emb[, 2] - 255
+y_coord <- max(vis_emb[, 1]) - vis_emb[, 1]
+y_coord <- y_coord - 100
+xy_old <- cbind(x_coord, y_coord)
+cells$PCW_11_REP_2$x_coord <- x_coord
+cells$PCW_11_REP_2$y_coord <- y_coord
+
+# Need to do some rotating
+rotation_angle <- 20 * (pi / 180) # 20 degrees counterclockwise (in radians)
+rot_mat <- matrix(c(cos(rotation_angle), -sin(rotation_angle),
+                    sin(rotation_angle), cos(rotation_angle)),
+                  ncol = 2)
+xy_new <- rot_mat %*% t(xy_old)
+cells$PCW_11_REP_2$x_new <- xy_new[1, ]
+cells$PCW_11_REP_2$y_new <- xy_new[2, ]
+
+cells$PCW_11_REP_2$theta_new <- ifelse(cells$PCW_11_REP_2$y_new > 0,
+                                       atan(abs(cells$PCW_11_REP_2$x_new / cells$PCW_11_REP_2$y_new)),
+                                       pi - atan(abs(cells$PCW_11_REP_2$x_new / cells$PCW_11_REP_2$y_new)))
+
+cells_sub <- subset(cells$PCW_11_REP_2, y_coord >= 0 & y_coord <= 280)
+
+in_first_mat_traj <- (abs(cells_sub$x_new) <= 20) & (cells_sub$y_new >= -10)
+prop_first <- prop.table(table(in_first_mat_traj))[["TRUE"]]
+
+cells_sub$first_mat_traj <- cells_sub$y_new
+cells_sub$second_mat_traj <- cells_sub$theta_new
+
+norm_0_1 <- function(x) {
+    x <- x - min(x)
+    x <- x / max(x)
+
+    return(x)
+}
+
+# Make two trajectories join and go from 0 -> 1 smoothly
+first_mat_traj_renorm <- prop_first * norm_0_1(cells_sub$first_mat_traj[in_first_mat_traj])
+second_mat_traj_renorm <- prop_first + ((1 - prop_first) * norm_0_1(cells_sub$second_mat_traj[!in_first_mat_traj]))
+
+cells_sub$maturation <- NA
+cells_sub$maturation[in_first_mat_traj] <- first_mat_traj_renorm
+cells_sub$maturation[!in_first_mat_traj] <- second_mat_traj_renorm
+cells$PCW_11_REP_2_sub <- cells_sub
+
+if (compile_all) {
+    cside_outs <- list()
+    cside_outs[["PCW_11_REP_2"]] <- run_cside(cells_sub, reference, "PCW_11_REP_2")
+}
+
+
+# Define maturation for PCW_17_REP_3
+
+cells$PCW_17_REP_3 <- add_visual_reduction(cells$PCW_17_REP_3)
+
+vis_emb <- cells$PCW_17_REP_3@reductions$visual@cell.embeddings
+x_coord <- vis_emb[, 2]
+y_coord <- max(vis_emb[, 1]) - vis_emb[, 1]
+y_coord <- y_coord
+xy_old <- cbind(x_coord, y_coord)
+cells$PCW_17_REP_3$x_coord <- x_coord
+cells$PCW_17_REP_3$y_coord <- y_coord
+cells$PCW_17_REP_3$y_coord_1 <- y_coord - 250
+cells_sub <- subset(cells$PCW_17_REP_3, x_coord >= 145)
+
+cells_sub$theta_1 <- atan((max(cells_sub$x_coord) - cells_sub$x_coord) / cells_sub$y_coord_1)
+cells_sub$exclude <- (cells_sub$theta_1 <= 0) & (cells_sub$theta_1 >= -0.5)
+cells_sub <- subset(cells_sub, exclude == FALSE)
+cells_sub <- subset(cells_sub,
+                    (y_coord < 100) & (x_coord < 250) & (c2l_hDA2 < 0.4),
+                    invert = TRUE)
+
+cells_sub$use_first_mat_traj <- cells_sub$y_coord >= 270
+prop_first <- prop.table(table(cells_sub$use_first_mat_traj))[["TRUE"]]
+
+first_mat_traj_idxs <- cells_sub$use_first_mat_traj
+cells_sub$maturation <- NA
+cells_sub$first_maturation <- norm_0_1(-cells_sub$x_coord)
+cells_sub$maturation[first_mat_traj_idxs] <- prop_first * norm_0_1(cells_sub$first_maturation[first_mat_traj_idxs])
+
+cells_sub$theta <- (pi / 2) - atan((max(cells_sub$x_coord) - cells_sub$x_coord) / (max(cells_sub$y_coord) - cells_sub$y_coord))
+cells_sub$maturation[first_mat_traj_idxs == FALSE] <- prop_first + ((1 - prop_first) * norm_0_1(cells_sub$theta[first_mat_traj_idxs == FALSE]))
+cells$PCW_17_REP_3_sub <- cells_sub
+
+if (compile_all) {
+    cside_outs[["PCW_17_REP_3"]] <- run_cside(cells_sub, reference, "PCW_17_REP_3")
+}
+
+
+# Define maturation for PCW_7_REP_3
+
+cells$PCW_7_REP_3 <- add_visual_reduction(cells$PCW_7_REP_3)
+
+vis_emb <- cells$PCW_7_REP_3@reductions$visual@cell.embeddings
+x_coord <- vis_emb[, 2]
+y_coord <- max(vis_emb[, 1]) - vis_emb[, 1]
+xy_old <- cbind(x_coord, y_coord)
+cells$PCW_7_REP_3$x_coord <- x_coord
+cells$PCW_7_REP_3$y_coord <- y_coord
+cells$PCW_7_REP_3$maturation <- norm_0_1(cells$PCW_7_REP_3$y_coord)
+
+if (compile_all) {
+    cside_outs[["PCW_7_REP_3"]] <- run_cside(cells$PCW_7_REP_3, reference, "PCW_7_REP_3")
+}
+
+# Define maturation for organoids
+for (s in nice_organoids) {
+    mins <- colMins(cells[[s]]@reductions$visual@cell.embeddings,
+                    useNames = TRUE)
+    maxs <- colMaxs(cells[[s]]@reductions$visual@cell.embeddings,
+                    useNames = TRUE)
+    center <- c(mins[1] + (maxs[1] - mins[1]) / 2,
+                mins[2] + (maxs[2] - mins[2]) / 2)
+    coords <- cells[[s]]@reductions$visual@cell.embeddings
+    cells[[s]]$maturation <- apply(coords, 1, function(x) {
+                                       sqrt((x[1] - center[1])^2 + (x[2] - center[2])^2)
+                })
+    cells[[s]]$maturation <- norm_0_1(cells[[s]]$maturation)
+
+    if (compile_all) {
+        cside_outs[[s]] <- run_cside(cells[[s]], reference, s)
+    }
+}
+
+if (compile_all) {
+    for (s in names(cside_outs)) {
+        cside_outs[[s]]$sample_name <- s
+    }
+    out_spreadsheet <- createWorkbook()
+    df <- do.call(rbind, cside_outs)
+    sheet_name <- "maturation_degs"
+    addWorksheet(out_spreadsheet, sheet_name)
+    writeData(out_spreadsheet, sheet_name, df, rowNames = FALSE)
+    saveWorkbook(out_spreadsheet, "../out_data/all_maturation_degs.xlsx",
+                 overwrite = TRUE)
+}
+```
+
+```{r plot_maturation}
+plot_list <- list()
+for (sample_name in nice_samples) {
+    if (sample_name == "PCW_11_REP_2") {
+        s <- "PCW_11_REP_2_sub"
+    } else if (sample_name == "PCW_17_REP_3") {
+        s <- "PCW_17_REP_3_sub"
+    } else {
+        s <- sample_name
+    }
+
+    line_width <- 0.5
+    end_arrow <- arrow(type = "closed", angle = 30,
+                       length = unit(0.05, units = "npc"))
+    p <- SpatialFeaturePlot(cells[[s]], "maturation", stroke = NA) +
+            scale_fill_gradient(low = "yellow", high = "red",
+                                breaks = c(0.1, 0.9),
+                                labels = c("Low", "High"))
+
+    if (sample_name == "PCW_7_REP_3") {
+        p <- p + geom_segment(aes(x = p$data$imagecol[which.min(p$data$maturation)],
+                                  y = p$data$imagerow[which.max(p$data$maturation)] + 10),
+                              xend = p$data$imagecol[which.max(p$data$maturation)],
+                              yend = p$data$imagerow[which.min(p$data$maturation)] - 10,
+                              arrow = end_arrow,
+                              linewidth = line_width)
+    } else if (sample_name == "PCW_11_REP_2") {
+        first_seg_end_x <- 200
+        first_seg_end_y <- 310
+        min_y <- min(p$data$imagerow)
+        p <- p + geom_segment(aes(x = 250, y = 195.5,
+                                  xend = first_seg_end_x, yend = first_seg_end_y),
+                              linewidth = line_width) +
+                 geom_curve(aes(x = first_seg_end_x, y = first_seg_end_y,
+                                xend = 150, yend = 210),
+                            linewidth = line_width,
+                            curvature = 0.9, ncp = 10, angle = 30,
+                            arrow = end_arrow) +
+                 geom_curve(aes(x = first_seg_end_x, y = first_seg_end_y,
+                                xend = 400, yend = 210),
+                            linewidth = line_width,
+                            arrow = end_arrow, curvature = -0.9, ncp = 10,
+                            angle = 140)
+    } else if (sample_name == "PCW_17_REP_3") {
+        first_seg_end_x <- 200
+        first_seg_end_y <- 380
+        p <- p + geom_segment(aes(x = 450, y = 380, xend = first_seg_end_x,
+                                  yend = first_seg_end_y),
+                              linewidth = line_width) +
+                 geom_curve(aes(x = first_seg_end_x, y = first_seg_end_y + 1,
+                                xend = 380, yend = 200),
+                            linewidth = line_width,
+                            arrow = end_arrow, curvature = 0.5, ncp = 10,
+                            angle = 90)
+    } else {
+        # Organoid
+        # For some reason, finding the co-ordinates more programatically seems
+        # to break things
+        if (sample_name == "Donor1_day40_dif2_org2") {
+            p <- p + geom_segment(aes(x = 333, y = 215, xend = 368,
+                                      yend = 215),
+                                  linewidth = line_width, arrow = end_arrow)
+        } else if (sample_name == "Donor2_day70_dif2_org2") {
+            p <- p + geom_segment(aes(x = 402, y = 188, xend = 450,
+                                      yend = 188),
+                                  linewidth = line_width, arrow = end_arrow)
+        } else {
+            p <- p + geom_segment(aes(x = 285, y = 309, xend = 330,
+                                      yend = 309),
+                                  linewidth = line_width, arrow = end_arrow)
+        }
+    }
+
+    if (substr(sample_name, 1, 3) == "PCW") {
+        plot_title <- paste(strsplit(sample_name, "_")[[1]][2], "pcw")
+    } else {
+        d <- strsplit(substr(sample_name, 11, nchar(sample_name)), "_")[[1]][1]
+        plot_title <- paste0("d", d)
+    }
+
+    p_leg <- p + theme(legend.position = "left") +
+                labs(fill = "Maturation")
+    p <- p + theme(legend.position = "none",
+                   plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+    p <- FixSpatialPlot(p, sample_name = sample_name)
+    p <- p + annotate(geom = "text", x = 0.5, y = 1, hjust = 0.5,
+                      label = plot_title, size = 8)
+
+    plot_list[[sample_name]] <- p
+}
+tissue_plots <- ggarrange(plotlist = plot_list[1:3], nrow = 1)
+organoid_plots <- ggarrange(plotlist = plot_list[4:6], nrow = 1)
+p <- ggarrange(ggplot() + theme_void(), tissue_plots, organoid_plots,
+               ggplot() + theme_void(), nrow = 4, heights = c(0.15, 1, 1, 0))
+
+fig_list$fig_5[["maturation_paths"]] <- p
+
+file_name <- paste0(fig_paths[["main"]], "maturation_paths",
+                    output_figure_format)
+ggsave(p, filename = file_name, units = "cm", dpi = 300, height = 6,
+       width = 10)
+```
+
+## Plotting CSIDE results
+
+```{r plot_cside_results_multi_sample}
+window_length <- 50
+max_idx <- max(sapply(nice_samples,
+                      function(s) {
+                          s <- ifelse(s %in% nice_tissues[2:3], paste0(s, "_sub"), s)
+                          num_spots <- ncol(cells[[s]])
+                          return(num_spots - window_length)
+                      }))
+
+plot_list <- list()
+for (gene in c("TH", "CAMK2N1", "LMO4", "SPOCK1", "MTRNR2L12", "MT-ND5")) {
+        mat_df <- data.frame(matrix(ncol = 3, nrow = 0))
+        colnames(mat_df) <- c("Sample", "gene_expr", "mat_idx")
+        for (sample_name in nice_samples) {
+            s <- ifelse(sample_name %in% nice_tissues[2:3],
+                        paste0(sample_name, "_sub"), sample_name)
+            ad <- GetAssayData(cells[[s]], assay = "SCT")
+            mat_order <- order(cells[[s]]$maturation)
+            g_expr_wrt_mat <- ad[which(rownames(ad) == gene), ][mat_order]
+            avg_expr <- sapply(1:(length(g_expr_wrt_mat) - window_length),
+                               function(x) {
+                                   mean(g_expr_wrt_mat[x:(x + window_length)])
+                               })
+            avg_expr <- avg_expr / max(avg_expr)
+            num_spots_minus_window <- ncol(ad) - window_length
+            mat_idx <- max_idx * seq(num_spots_minus_window) / num_spots_minus_window
+            new_rows <- data.frame("Sample" = sample_name,
+                                   "gene_expr" = avg_expr,
+                                   "mat_idx" = mat_idx)
+            mat_df <- rbind(mat_df, new_rows)
+        }
+
+    x_arrow <- arrow(type = "closed", angle = 30,
+                     length = unit(0.5, units = "npc"))
+    colors <- c("#FFC2C2", "#C36767", "#FF0000", "#9B9AE4", "#4592D4",
+                "#000EFF")
+
+    mat_df$Sample <- factor(mat_df$Sample, levels = nice_samples)
+    num_lines <- length(unique(mat_df$Sample))
+    expr_range <- max(mat_df$gene_expr) - min(mat_df$gene_expr)
+
+    p <- ggplot(mat_df,
+                aes(x = mat_idx, y = gene_expr, color = Sample)) +
+            geom_line() +
+            theme_minimal() +
+            theme(panel.grid = element_blank(),
+                  legend.title = element_blank(),
+                  axis.title = element_text(size = 6),
+                  axis.line.x = element_line(arrow = x_arrow),
+                  axis.line.y = element_line(arrow = x_arrow),
+                  axis.text = element_blank(),
+                  plot.title = element_blank(),
+                  legend.margin = margin(t = -0.3, l = 0.3, unit = "cm")) +
+            xlab("Maturation") +
+            ylab(gene) +
+            scale_color_manual(values = colors[seq(1, num_lines)], labels = s_names_abbr) +
+            guides(colour = guide_legend(ncol = 1, override.aes = list(linewidth = 1))) +
+            scale_x_continuous(breaks = c(0.05, 0.95) * max(mat_df$mat_idx)) +
+            scale_y_continuous(breaks = min(mat_df$gene_expr) + (c(0.05, 1) * expr_range)) +
+            theme(plot.margin = unit(c(0, 0, 0.3, 0.3), "cm"))
+            pub_fig_theme
+
+     plot_list[[gene]] <- p
+}
+
+p <- ggarrange(plotlist = plot_list, nrow = 2, ncol = 3, common.legend = TRUE,
+               legend = "right") +
+        theme(legend.title = element_blank())
+fig_list$fig_5[["all_genes_avg_per_sample"]] <- p
+ggsave(p, filename = paste0(fig_paths[["supplementary"]],
+                            "all_genes_avg_per_sample", output_figure_format),
+       dpi = 300, width = 40, height = 12, units = "cm")
+
+fig_list$fig_5$row_2 <- ggarrange(ggplot() + theme_void(),
+                                  fig_list$fig_5$maturation_paths,
+                                  fig_list$fig_5$all_genes_avg_per_sample,
+                                  ggplot() + theme_void(),
+                                  nrow = 1, widths = c(-0.5, 1, 3, -0.3)) &
+                            pub_fig_theme &
+                            theme(axis.title = element_blank())
+fig_list$fig_5$row_2 <- ggarrange(ggplot() + theme_void(),
+                                  fig_list$fig_5$row_2,
+                                  ggplot() + theme_void(),
+                                  ncol = 1, heights = c(0, 1, -0.1))
+```
+
+## DEGs between maturation regions
+
+```{r degs_between_maturation_regions}
+flip <- function(x) {
+    # Flip y axis of SpatialDimPlot
+    min_x <- min(x)
+    max_x <- max(x)
+    at_0 <- x - min_x
+    flipped <- -1 * at_0
+    return(flipped + min_x + max_x)
+}
+
+markers <- c("TH", "CALB1", "ALDH1A1")
+s <- "PCW_17_REP_3"
+dot_plots <- list()
+vln_plots <- list()
+spatial_plots <- list()
+expr_plots <- list()
+cells_to_use <- cells[[s]]
+
+region_colors <- list("1" = "#D81B60", "2" = "#1E88E5", "3" = "#FFC107",
+                      "4" = "#78ECD9")
+genes_to_plot <- c("EN1", "TH", "DDC", "TUBA1A", "NNAT", "SLC6A4", "FEV",
+                   "SLC17A6", "NRN1", "ADCY1", "NR2F1", "SCG2")
+
+ad <- GetAssayData(cells_to_use, slot = "data")[markers, ]
+min_ad <- min(ad)
+max_ad <- max(ad)
+
+maturation_ids <- read.csv(paste0("../data/maturation_labellings/", s,
+                                  "_mat_regions_TH.csv"))
+maturation_ids_idxs <- match(colnames(cells_to_use),
+                             maturation_ids$Barcode)
+cells_to_use$mat_region <- maturation_ids[maturation_ids_idxs,
+                                          "subcluster"]
+
+non_th56_idxs <- (!cells_to_use$mat_region %in% c("TH_5", "TH_6")) | is.na(cells_to_use$mat_region)
+cells_to_use <- cells_to_use[, non_th56_idxs]
+
+cells_to_use$mat_region_num <- sapply(cells_to_use$mat_region,
+                                      function(x) {
+                                      substr(x, nchar(x), nchar(x) + 1)})
+
+cells_sub <- cells_to_use[, !is.na(cells_to_use$mat_region_num)]
+
+df <- cbind(GetTissueCoordinates(cells_sub), cells_sub$mat_region_num)
+colnames(df) <- c("imagerow", "imagecol", "mat_region_num")
+df[, markers] <- 1
+df$imagerow <- flip(df$imagerow)
+
+# Compute convex hulls around each group of points:
+chulls <- data.frame(matrix(ncol = ncol(df), nrow = 0))
+colnames(chulls) <- colnames(df)
+for (i in unique(df$mat_region_num)) {
+    df_sub <- subset(df, mat_region_num == i)
+    chull_df_sub <- df_sub[chull(df_sub[, c("imagerow", "imagecol")]), ]
+    chulls <- rbind(chulls, chull_df_sub)
+}
+breaks <- round(range(c(min_ad, max_ad)))
+
+for (g in markers) {
+    fp <- SpatialFeaturePlot(cells_to_use, g, stroke = NA) +
+            scale_fill_gradient(low = "white", high = "red",
+                                limits = c(min_ad, max_ad),
+                                breaks = seq(breaks[1], breaks[2], 1)) +
+            labs(fill = "Expr") +
+            theme(legend.position = "none")
+
+    p <- fp
+    expansion_amount <- 0.006
+    for (region in unique(chulls$mat_region_num)) {
+        p <- p +
+                geom_shape(data = subset(chulls, mat_region_num == region),
+                           aes(x = imagecol,
+                               y = imagerow + 110),
+                           fill = NA,
+                           color = region_colors[[as.character(region)]],
+                           expand = expansion_amount)
+    }
+
+    p <- FixSpatialPlot(p, sample_name = s)
+
+    p <- p %>%
+            annotate_figure(top = text_grob(g))
+
+    spatial_plots[[g]] <- p
+
+    all_pairs <- t(combn(sort(unique(cells_to_use$mat_region_num)), 2))
+
+    fm_outs_list <- list()
+    for (i in seq(1, nrow(all_pairs))) {
+        pair <- all_pairs[i, ]
+        message(pair)
+        marks <- FindMarkers(cells_to_use, group.by = "mat_region_num",
+                             ident.1 = pair[1], ident.2 = pair[2],
+                             verbose = FALSE)
+        marks$gene <- rownames(marks)
+        pair_name <- paste0(pair[1], "_", pair[2])
+        marks$comparison <- pair_name
+        fm_outs_list[[pair_name]] <- marks
+    }
+
+    mat_region_degs <- do.call(rbind, fm_outs_list) %>%
+                        filter(p_val_adj <= 0.05) %>%
+                        arrange(-avg_log2FC) %>%
+                        distinct(gene) %>%
+                        pull(gene)
+
+    cells_sub <- cells_to_use[, is.na(cells_to_use$mat_region_num) == FALSE]
+
+    dot_plots[[g]] <- DotPlot(cells_sub, features = mat_region_degs,
+                              group.by = "mat_region_num", dot.scale = 4) +
+                        theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+                              axis.title.x = element_blank(),
+                              legend.text = element_text(size = 8),
+                              legend.title = element_text(size = 8)) +
+                        scale_size_continuous(breaks = c(0, 50, 100)) +
+                        scale_color_viridis(breaks = c(-1, 0, 1)) +
+                        scale_y_discrete(limits = rev) +
+                        labs(color = "Avg. expression") +
+                        ylab("TH region") +
+                        guides(color = guide_colorbar(barwidth = 1,
+                                                      barheight = 2))
+
+    # Select only spots positive for g
+    g_pos_idxs <- GetAssayData(cells_sub)[g, ] > 0
+    cells_sub <- cells_sub[, g_pos_idxs]
+    ad <- GetAssayData(cells_sub[genes_to_plot, ],
+                       slot = "data")
+    breaks <- floor(range(ad))
+    df <- data.frame(t(ad), mat_region_num = cells_sub$mat_region_num,
+                     check.names = FALSE)
+    df <- tidyr::pivot_longer(df, cols = genes_to_plot,
+                              values_to = "value", names_to = "gene")
+    p <- ggplot(df, aes(x = mat_region_num, y = value,
+                        fill = mat_region_num)) +
+            geom_violin(linewidth = 0) +
+            theme(legend.position = "none",
+                  panel.grid.major.y = element_line(size = 0.1,
+                                                    color = "#ABABAB"),
+                  panel.grid.minor.y = element_line(size = 0.1,
+                                                    color = "#ABABAB")) +
+            geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = -Inf,
+                          ymax = Inf),
+                      colour = "black", fill = NA, inherit.aes = FALSE) +
+            scale_y_continuous(breaks = breaks[2],
+                               minor_breaks = seq(breaks[1], breaks[2],
+                                                  1)) +
+            scale_fill_manual(values = region_colors) +
+            facet_wrap(vars(gene), ncol = 1,
+                       strip.position = "right") +
+            xlab(paste0(g, "+ spots")) +
+            ylab("Expression") +
+            theme(axis.line.x = element_line(size = 0.2),
+                  axis.ticks.x = element_blank(),
+                  axis.title = element_text(size = 10),
+                  panel.spacing = unit(0, 'lines'),
+                  strip.background = element_rect(fill = NA),
+                  strip.text.y = element_text(angle = 0, size = 8))
+    vln_plots[[g]] <- p
+}
+
+leg_df <- data.frame(x = 1:4, y = 1:4, mat_region_num = names(region_colors))
+p_leg_l <- ggplot(leg_df, aes(x = x, y = y, color = mat_region_num)) +
+            geom_point() +
+            scale_color_manual(values = region_colors) +
+            labs(color = "Region")
+p_leg_l <- as_ggplot(get_legend(p_leg_l))
+
+p_leg_r <- as_ggplot(get_legend(fp + theme(legend.position = "right")))
+
+all_spatial_plots <- ggarrange(plotlist = spatial_plots, nrow = 1)
+all_spatial_plots <- ggarrange(p_leg_l, all_spatial_plots, p_leg_r, nrow = 1,
+                               widths = c(0.1, 0.8, 0.1))
+fig_list$fig_6$row_1 <- all_spatial_plots
+
+vln_plots <- ggarrange(plotlist = vln_plots, nrow = 1)
+all_expr_plots <- ggarrange(dot_plots[["TH"]], vln_plots, ncol = 1,
+                            heights = c(0.35, 0.65))
+fig_list$fig_6$row_2 <- all_expr_plots
+```
+
+# Cell-to-cell communication
+
+We use the COMMOT software to evaluate the expression of ligand-receptor pairs
+in our tissue.  The tool is implemented in Python, so this first chunk has
+already been run for the three samples of interest
+
+```{r save_for_commot}
+samples_for_commot <- c("PCW_11_REP_2", nice_organoids)
+
+for (s in samples_for_commot) {
+    as_sce <- as.SingleCellExperiment(cells[[s]], assay = "Spatial")
+    out_file <- paste0("../data/", s, "_for_commot.h5ad")
+    zellkonverter::writeH5AD(sce = as_sce, file = out_file)
+}
+```
+
+```{r}
+# Need to load this package so that we can use the COMMOT docker image in the
+# chunk below.
+library(docknitr)
+
+# Notice that, in the options to the chunk below, we bodge the image name to
+# allow us to mount the correct path to the data. This is necessary because we
+# will run the chunk in a different docker to the one that the rest of the
+# notebook is running in, and we therefore need to pass the absolute path to
+# the data on the host machine (i.e. outside the docker container), rather than
+# to the mounted location, which is what docknitr mounts by default.
+```
+
+```{r run_commot, engine="docker", image=c("--volume", paste0(Sys.getenv("HOST_MOUNT_PATH"), ":/workdir2"), "commot_docker"), share.files=TRUE}
+import commot as ct
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+df_ligrec = ct.pp.ligand_receptor_database(database="CellChat", species="human")
+sample_list = [
+    "PCW_11_REP_2",
+    "Donor1_day40_dif2_org2",
+    "Donor2_day70_dif2_org2",
+    "Donor1_day120_dif1_org1",
+]
+
+for sample_name in sample_list:
+    print(sample_name)
+    adata = sc.read_h5ad(f"/workdir2/data/{sample_name}_for_commot.h5ad")
+    adata.obsm["spatial"] = adata.obsm["VISUAL"]
+    adata.var_names_make_unique()
+    sc.pp.normalize_total(adata, inplace=True)
+    sc.pp.log1p(adata)
+
+    # Only look at pairs of cells at max distance 1000um (i.e. 10 spots)
+    ct.tl.spatial_communication(
+        adata,
+        database_name="user_database",
+        df_ligrec=df_ligrec,
+        dis_thr=1000,
+        heteromeric=True,
+    )
+
+    for db in ["sender", "receiver"]:
+        out_name = f"/workdir2/out_data/{sample_name}_commot_{db}_db.csv"
+        adata.obsm[f"commot-user_database-sum-{db}"].to_csv(out_name)
+```
+
+```{r analyse_commot_out}
+nice_sr_pairs <- c("PTN.PTPRZ1", "MDK.PTPRZ1", "MDK.LRP1", "MIF.ACKR3")
+gen_blended_plot <- function(cells_obj, sr_pair,
+                             s_name, r_name,
+                             bottom_right_col,
+                             show_image = TRUE) {
+    pl <- SpatialFeaturePlotBlend(cells_obj,
+                                  paste0("s.", sr_pair),
+                                  paste0("r.", sr_pair),
+                                  combine = FALSE,
+                                  column_1_alt_name = s_name,
+                                  column_2_alt_name = r_name,
+                                  bottom_right = bottom_right_col,
+                                  stroke = 0,
+                                  image.alpha = ifelse(show_image, 1, 0))
+    pl[[3]] <- pl[[3]] + theme(plot.title = element_blank())
+
+    return(pl[[3]])
+}
+bottom_right_col <- "#00FCFF"
+
+# Assume square. In form: c(top_left_x, top_left_y, side_length)
+rect_positions <- list("PCW_11_REP_2" = list(c(280, 200, 40),
+                                             c(230, 260, 40),
+                                             c(230, 310, 40)),
+                       "Donor1_day40_dif2_org2" = list(c(310, 195, 20)),
+                       "Donor2_day70_dif2_org2" = list(c(360, 160, 20)),
+                       "Donor1_day120_dif1_org1" = list(c(300, 280, 20)))
+sr_pair <- "PTN.PTPRZ1"
+
+outer_plot_list <- list()
+outer_plot_list_no_zooms <- list()
+for (s in samples_for_commot) {
+    file_prefix <- paste0("../out_data/", s, "_commot_")
+    sender_db <- read.csv(paste0(file_prefix, "sender_db.csv"))
+    receiver_db <- read.csv(paste0(file_prefix, "receiver_db.csv"))
+
+    rownames(sender_db) <- sender_db[, 1]
+    rownames(receiver_db) <- receiver_db[, 1]
+
+    commot_matrix <- t(cbind(sender_db[, -1], receiver_db[, -1]))
+    old_row_names <- rownames(commot_matrix)
+    commot_matrix <- apply(commot_matrix, 2, as.numeric)
+    rownames(commot_matrix) <- old_row_names
+    # Remove "total.total" rows:
+    commot_matrix <- commot_matrix[-which(grepl("total.total", rownames(commot_matrix))), ]
+    commot_matrix <- commot_matrix[, match(colnames(cells[[s]]), colnames(commot_matrix))]
+
+    commot_assay <- CreateAssayObject(data = commot_matrix, key = "COMMOT_")
+    cells[[s]][["COMMOT"]] <- commot_assay
+
+    cells[[s]] <- FindSpatiallyVariableFeatures(object = cells[[s]],
+                                                assay = "COMMOT",
+                                                slot = "data",
+                                                selection.method = "moransi")
+    spat_var <- SpatiallyVariableFeatures(cells[[s]], assay = "COMMOT",
+                                          selection.method = "moransi")
+    spat_var_without_prefix <- sapply(spat_var,
+                                      function(x) {
+                                          paste0(strsplit(x, ".", fixed = TRUE)[[1]][-1],
+                                                 collapse = ".")
+                                      })
+    uniq_spat_var_pairs <- unique(spat_var_without_prefix)
+
+    ad <- GetAssayData(cells[[s]], assay = "COMMOT")
+    num_spots_expr <- function(sr) {
+        sum(apply(ad[grepl(sr, rownames(ad)), ], 2,
+                  function(x) {
+                      any(x > 0.1)
+                  }))
+    }
+    highly_expressed_idxs <- sapply(uniq_spat_var_pairs, num_spots_expr) > 10
+    uniq_spat_var_pairs <- uniq_spat_var_pairs[highly_expressed_idxs]
+
+    sr_pairs_to_plot <- head(c(nice_sr_pairs, uniq_spat_var_pairs), n = 9)
+
+    old_default_assay <- DefaultAssay(cells[[s]])
+    DefaultAssay(cells[[s]]) <- "COMMOT"
+
+    all_s_0 <- all(ad[paste0("s.", sr_pair), ] == 0)
+    all_r_0 <- all(ad[paste0("r.", sr_pair), ] == 0)
+    if (all_s_0 | all_r_0) {
+        return(ggplot() + theme_void())
+    }
+    splat <- strsplit(sr_pair, ".", fixed = TRUE)
+    s_name <- splat[[1]][1]
+    r_name <- splat[[1]][2]
+
+    bp <- gen_blended_plot(cells[[s]], sr_pair, s_name, r_name,
+                           bottom_right_col)
+    bp_out <- bp
+
+    border_colors <- c("#0000FF", "#CC33FF", "#CFEB99")
+
+    bp_zoom_list <- list()
+    for (rect_pos in rect_positions[[s]]) {
+        rect_pos_str <- paste0(rect_pos, collapse = "_")
+        rect_x_min <- rect_pos[1]
+        rect_x_max <- rect_x_min + rect_pos[3]
+        rect_y_min <- rect_pos[2]
+        rect_y_max <- rect_y_min + rect_pos[3]
+        border_color <- border_colors[length(bp_zoom_list) + 1]
+
+        bp_out <- bp_out + geom_rect(xmin = rect_x_min, xmax = rect_x_max,
+                                         ymin = rect_y_min, ymax = rect_y_max,
+                                     color = border_color, fill = NA,
+                                     linewidth = 0.75)
+
+        bp_zoom_list[[rect_pos_str]] <- gen_blended_plot(cells[[s]], sr_pair,
+                                                         s_name, r_name,
+                                                         bottom_right_col,
+                                                         show_image = FALSE) +
+                                        coord_cartesian(xlim = c(rect_x_min,
+                                                                 rect_x_max),
+                                                        ylim = c(rect_y_min,
+                                                                 rect_y_max)) +
+                                        theme(panel.border = element_rect(colour = border_color,
+                                                                          fill = NA,
+                                                                          size = 2))
+        bp_zoom_list[[rect_pos_str]] <- FixSpatialPlot(bp_zoom_list[[rect_pos_str]],
+                                                   paste0(s, "_sub"))
+    }
+
+    p <- ggarrange(FixSpatialPlot(bp_out),
+                   ggplot() + theme_void(),
+                   ggarrange(plotlist = bp_zoom_list, ncol = 1),
+                   nrow = 1,
+                   widths = c(ifelse(length(bp_zoom_list) > 1, 1.5, 0.5),
+                              ifelse(length(bp_zoom_list) > 1, 0, -0.1),
+                              0.5))
+
+
+    outer_plot_list[[s]] <- p
+    ggsave(p,
+           filename = paste0("../paper_figs/main/commot_nice_and_spat_var_sr_pairs_", s,
+                             ".pdf"),
+           dpi = 300, units = "cm", height = 20, width = 20)
+
+    splat <- strsplit(sr_pair, ".", fixed = TRUE)
+    s_name <- splat[[1]][1]
+    r_name <- splat[[1]][2]
+    pl <- lapply(sr_pairs_to_plot,
+                 function(sr_pair) {
+                     p <- SpatialFeaturePlotBlend(cells[[s]], paste0("s.", sr_pair),
+                                             paste0("r.", sr_pair),
+                                             combine = FALSE,
+                                             bottom_right = bottom_right_col,
+                                             stroke = 0)[[3]] +
+                            ggtitle(gsub(".", " → ", sr_pair, fixed = TRUE)) +
+                                        theme(plot.title = element_text(hjust = 0.5, size = 7))
+
+                     FixSpatialPlot(p)
+                 })
+    outer_plot_list_no_zooms[[s]] <- ggarrange(plotlist = pl, nrow = 1)
+
+    DefaultAssay(cells[[s]]) <- old_default_assay
+}
+
+p <- ggarrange(plotlist = outer_plot_list_no_zooms, ncol = 1)
+ggsave(p, filename = paste0("../paper_figs/main/commot_nice_and_spat_var_sr_",
+                            "pairs_no_zooms", output_figure_format),
+       dpi = 300, units = "cm", height = 15, width = 30)
+
+p <- ggarrange(outer_plot_list[[1]],
+               ggarrange(plotlist = outer_plot_list[2:4], ncol = 1),
+               ncol = 2, widths = c(0.6, 0.4))
+
+p_leg <- SpatialFeaturePlotBlend(cells$PCW_7_REP_3, "nFeature_Spatial",
+                                 "nCount_Spatial", combine = FALSE,
+                                 column_1_alt_name = "Ligand",
+                                 column_2_alt_name = "Receptor",
+                                 bottom_right = bottom_right_col,
+                                 stroke = 0)[[4]][[2]]
+legend_break_percentiles <- c(0.1, 0.9)
+p_leg <- p_leg +
+            scale_x_continuous(breaks = as.numeric(quantile(p_leg$data[, 1],
+                                                            legend_break_percentiles)),
+                               labels = c("Low", "High")) +
+            scale_y_continuous(breaks = as.numeric(quantile(p_leg$data[, 2],
+                                                            legend_break_percentiles)),
+                               labels = c("Low", "High")) +
+            theme(axis.ticks = element_blank(),
+                  axis.text.x = element_text(angle = 0, hjust = 0.5),
+                  axis.title.x = element_text(vjust = 5),
+                  axis.title.y = element_text(vjust = -5))
+p_leg <- ggarrange(ggplot() + theme_void(), p_leg, ncol = 1)
+p <- ggarrange(p_leg, p, widths = c(0.2, 0.8))
+
+fig_name <- "commot_blended_plots"
+file_name <- paste0(fig_paths[["main"]], fig_name,
+                    output_figure_format)
+
+ggsave(p, filename = file_name, units = "cm", dpi = 300, height = 15, width = 30)
+```
+
+# Comparison of spatial characteristics
+
+```{r similarity_quantification}
+for (s in nice_samples) {
+    c2l_cols <- grepl("c2l_", colnames(cells[[s]]@meta.data))
+    c2l_md_mat <- as.matrix(cells[[s]]@meta.data[, c2l_cols])
+    max_cts <- colnames(c2l_md_mat)[apply(c2l_md_mat, 1, which.max)]
+    cells[[s]]$max_c2l_cts <- max_cts
+}
+
+plot_list <- list()
+connections_df_list <- list()
+for (s in nice_samples) {
+    cells[[s]]$max_c2l_cts <- factor(cells[[s]]$max_c2l_cts, levels = colnames(c2l_md_mat))
+    dists <- as.matrix(stats::dist(cells[[s]]@reductions$visual@cell.embeddings))
+    imm_nbors_list <- lapply(1:ncol(cells[[s]]),
+                             function(x) {
+                                 imm_nbors_idxs <- dists[x, ] < 7.5 & dists[x, ] > 0
+                                 imm_nbors_tab <- table(cells[[s]]$max_c2l_cts[imm_nbors_idxs])
+                                 imm_nbors_tab <- as.numeric(imm_nbors_tab)
+
+                                 return(imm_nbors_tab)
+                             })
+    imm_nbors_df <- do.call(rbind, imm_nbors_list)
+    imm_nbors_df <- cbind(imm_nbors_df,
+                          data.frame(cluster = cells[[s]]$max_c2l_cts))
+    imm_nbors_df$cluster <- factor(imm_nbors_df$cluster,
+                                   levels = levels(cells[[s]]$max_c2l_cts))
+
+    connections_list <- lapply(levels(imm_nbors_df$cluster),
+                               function(clus) {
+                                   cluster_sub <- subset(imm_nbors_df, cluster == clus)
+                                   if (nrow(cluster_sub) == 0) {
+                                       cs <- rep(0, length(levels(imm_nbors_df$cluster)))
+                                   } else {
+                                       cs <- colSums(cluster_sub[-which(colnames(cluster_sub) == "cluster")])
+                                   }
+                                   names(cs) <- levels(imm_nbors_df$cluster)
+                                   return(cs)
+                               })
+    names(connections_list) <- levels(imm_nbors_df$cluster)
+
+    connections_mat_list <- lapply(names(connections_list),
+                                   function(x) {
+                                       mat <- as.matrix(connections_list[[x]])
+                                       cbind(rownames(mat), mat, x)
+                                   })
+    connections_mat <- do.call(rbind, connections_mat_list)
+    colnames(connections_mat) <- c("to", "num_links", "from")
+    connections_df <- as.data.frame(connections_mat)
+    connections_df$num_links <- as.numeric(connections_df$num_links)
+    connections_df$from <- factor(connections_df$from,
+                                  levels = levels(cells[[s]]$max_c2l_cts))
+    connections_df$to <- factor(connections_df$to,
+                                  levels = levels(cells[[s]]$max_c2l_cts))
+    connections_df_list[[s]] <- connections_df
+}
+
+samples_connections_dims_list <- lapply(connections_df_list, function(x) {x$num_links})
+samples_connections_dims <- do.call(rbind, samples_connections_dims_list)
+
+samples_connections_dims <- t(apply(samples_connections_dims, 1, function(x) {x / sum(x)}))
+
+samples_connections_dists <- as.matrix(stats::dist(samples_connections_dims))
+samples_connections_dists <- max(samples_connections_dists) - samples_connections_dists
+samples_connections_dists <- round(samples_connections_dists / max(samples_connections_dists), 2)
+samples_connections_dists[upper.tri(samples_connections_dists)] <- NA
+melted_samples_connections_dists <- melt(samples_connections_dists, na.rm = TRUE)
+colnames(melted_samples_connections_dists)[3] <- "Similarity"
+
+p <- ggplot(data = melted_samples_connections_dists,
+            aes(x = Var1, y = Var2, fill = Similarity)) +
+    geom_tile() +
+    scale_x_discrete(labels = nice_samples) +
+    scale_y_discrete(labels = nice_samples) +
+    geom_text(aes(Var1, Var2, label = Similarity), color = "black", size = 4) +
+    scale_fill_gradientn(colors = inferno(100)) +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          legend.title = element_text(size = 14))
+
+fig_name <- "spatial_connections_similarity_heatmap"
+file_name <- paste0(fig_paths[["main"]], fig_name,
+                    output_figure_format)
+fig_list[["main"]][[fig_name]] <- p
+ggsave(p, filename = file_name, units = "cm", height = 11.5, width = 15,
+       dpi = 300)
+
+samples_connections_dists_sub <- samples_connections_dists[4:6, 1:3]
+estimated_pcws <- apply(samples_connections_dists_sub, 1,
+                        function(x) {
+                            c(x[1] * 7, x[2] * 11, x[3] * 17) / sum(x)
+                        })
+estimated_pcws <- data.frame(t(estimated_pcws))
+estimated_pcws$org_name <- rownames(estimated_pcws)
+estimated_pcws$org_name <- factor(estimated_pcws$org_name,
+                                  levels = c("Donor1_day120_dif1_org1",
+                                             "Donor2_day70_dif2_org2",
+                                             "Donor1_day40_dif2_org2"))
+estimated_pcws <- tidyr::pivot_longer(estimated_pcws,
+                                      cols = -org_name,
+                                      names_to = "tissue",
+                                      values_to = "similarity")
+estimated_pcws$tissue <- factor(estimated_pcws$tissue,
+                                levels = c("PCW_17_REP_3", "PCW_11_REP_2",
+                                           "PCW_7_REP_3"))
+
+p <- ggplot(estimated_pcws,
+            aes(estimated_pcws, fill = tissue, y = similarity,
+                x = org_name)) +
+        theme_bw() +
+        geom_bar(position = "stack", stat = "identity") +
+        scale_y_continuous(breaks = c(0, 7, 11, 17), limits = c(0, 17),
+                           expand = expansion(mult = c(0, 0.02))) +
+        scale_fill_manual(values=c("#D6618C", "#F9D15A", "#58A1E0"),
+                          breaks = c(rev(levels(estimated_pcws$tissue)))) +
+        geom_text(aes(label = after_stat(y), group = org_name),
+                  stat = 'summary', fun = function(x) {round(sum(x), 1)},
+                  hjust = -0.1) +
+        coord_flip() +
+        theme(axis.title.y = element_blank(),
+              panel.grid.major.y = element_blank(),
+              panel.grid.major.x = element_blank(),
+              panel.grid.minor.x = element_blank(),
+              legend.title = element_blank()) +
+        ylab("Estimated PCW")
+ggsave(p, filename = paste0("../paper_figs/main/estimated_pcw", output_figure_format),
+       units = "cm", height = 4, width = 20, dpi = 300)
+```
+
+# Assemble plots
+
+```{r assemble_plots}
+# Figure 5
+p <- wrap_plots(fig_list$fig_5[paste0("row_", 1:4)], ncol = 1,
+                heights = c(3.5, 2, 2, 1.5))
+file_name <- paste0(fig_paths[["main"]], "fig_5", output_figure_format)
+ggsave(p, filename = file_name, units = "cm", height = 22,
+       width = a4_width, dpi = 300)
+
+# Figure 6
+p <- ggarrange(plotlist = fig_list$fig_6[paste0("row_", 1:2)], ncol = 1,
+               heights = c(0.3, 0.7))
+file_name <- paste0(fig_paths[["main"]], "fig_6", output_figure_format)
+# Need height of 18cm
+ggsave(p, filename = file_name, units = "cm", height = 18,
+       width = a4_width, dpi = 300)
+```
+
+
+
+# Session info
+
+<details>
+<summary>Click to reveal details of R session</summary>
+```{r session_info}
+sessionInfo()
+```
+
+<!-- https://stackoverflow.com/a/36777618 -->
+```{r package_versions, results = "markup"}
+installed.packages()[names(sessionInfo()$otherPkgs), "Version"]
+```
+
+<!-- Stop large blank section at end of report (https://stackoverflow.com/a/57381047) -->
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
+</details>
