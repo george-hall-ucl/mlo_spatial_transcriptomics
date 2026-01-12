@@ -1,7 +1,7 @@
 ---
 title: "Spatial Transcriptomic Analysis of Brain Organoids "
 author: "George T. Hall"
-date: "Compiled on 06 November 2025"
+date: "Compiled on 12 January 2026"
 output:
     html_document:
         toc: true
@@ -878,7 +878,8 @@ main_c2l <- c("c2l_hRgl1", "c2l_hProgFPM", "c2l_hNbDA", "c2l_hPreDA",
               "c2l_hDA1a", "c2l_hDA1b", "c2l_hDA2", "c2l_hDA3/hGABA/hSer")
 supp_c2l_1 <- c("c2l_hRgl2/immAstro", "c2l_hRgl3_caudal",
                 "c2l_hRgl4/MultiEpend", "c2l_hMidPre", "c2l_hNPro",
-                "c2l_hProgM", "c2l_hNbGaba", "c2l_Astro")
+                "c2l_hProgM", "c2l_hProgFPM", "c2l_hPreDA", "c2l_hNbGaba",
+                "c2l_Astro")
 supp_c2l_2 <- c("c2l_OPC_1", "c2l_OPC_2", "c2l_hMgl", "c2l_hEndo",
                 "c2l_hPeric", "c2l_Eryth", "c2l_VascLepto", "c2l_Unk")
 c2l_cts <- list("main" = list("main" = main_c2l),
@@ -1285,8 +1286,8 @@ gc()
 
 ```
 ##             used   (Mb) gc trigger    (Mb)   max used    (Mb)
-## Ncells  14230070  760.0   21900860  1169.7   21900860  1169.7
-## Vcells 849270702 6479.5 4178214862 31877.3 5175077528 39482.8
+## Ncells  14231693  760.1   21913988  1170.4   21913988  1170.4
+## Vcells 849262849 6479.4 4178205272 31877.2 5175067538 39482.7
 ```
 
 Now we are ready to run CSIDE.
@@ -2337,7 +2338,7 @@ p <- ggplot(data = melted_samples_connections_dists,
     geom_tile() +
     scale_x_discrete(labels = nice_samples) +
     scale_y_discrete(labels = nice_samples) +
-    geom_text(aes(Var1, Var2, label = Similarity), color = "black", size = 4) +
+    geom_text(aes(Var1, Var2, label = Similarity), color = "black", size = 11) +
     scale_fill_gradientn(colors = inferno(100)) +
     theme_minimal() +
     theme(axis.title = element_blank(),
@@ -2421,7 +2422,7 @@ p <- ggarrange(plotlist = fig_list$fig_6[paste0("row_", 1:2)], ncol = 1,
                heights = c(0.3, 0.7))
 file_name <- paste0(fig_paths[["main"]], "fig_6", output_figure_format)
 # Need height of 18cm
-ggsave(p, filename = file_name, units = "cm", height = 18,
+ggsave(p, filename = file_name, units = "cm", height = 21,
        width = a4_width, dpi = 300)
 ```
 
